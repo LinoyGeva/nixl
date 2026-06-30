@@ -74,8 +74,17 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int active_rank_bound, int num_local_experts, int rank,
          int num_warp_groups, int num_warps_per_group,
-         bool round_scale, uint64_t timeout_cycles, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr) {
-    auto nixl_ctx = *nixl_ctx_ptr;
+         bool round_scale, uint64_t timeout_cycles, int phases, nixl_ep::gpu_nixl_ctx** nixl_ctx_pp) {
+    // Double-indirection: one elected thread acquire-loads the active slot
+    // pointer once into shared, so every thread in this block (and every RDMA
+    // transfer it issues) snapshots the SAME slot even if a control-path flip
+    // lands mid-grid. The acquire pairs with the release-store in activate_ctx.
+    __shared__ nixl_ep::gpu_nixl_ctx* s_nixl_ctx_ptr;
+    if (threadIdx.x == 0)
+        s_nixl_ctx_ptr = reinterpret_cast<nixl_ep::gpu_nixl_ctx*>(
+            ld_acquire_sys_global(reinterpret_cast<const uint64_t*>(nixl_ctx_pp)));
+    __syncthreads();
+    auto nixl_ctx = *s_nixl_ctx_ptr;
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -399,7 +408,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               uint64_t timeout_cycles,
               void* workspace, int num_device_sms,
-              cudaStream_t stream, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx) {
+              cudaStream_t stream, int phases, nixl_ep::gpu_nixl_ctx** nixl_ctx) {
     constexpr int kNumMaxTopK = 11;
     const int active_expert_bound = active_rank_bound * num_experts_per_rank;
     const int num_warp_groups = ceil_div(active_expert_bound, num_device_sms);
@@ -620,8 +629,15 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int active_rank_bound, int num_local_experts, int rank,
         int num_warp_groups, int num_warps_per_group,
-        uint64_t timeout_cycles, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr) {
-    auto nixl_ctx = *nixl_ctx_ptr;
+        uint64_t timeout_cycles, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx** nixl_ctx_pp) {
+    // Double-indirection: see dispatch() above. One elected thread acquire-loads
+    // the active slot pointer into shared so the whole block uses one snapshot.
+    __shared__ nixl_ep::gpu_nixl_ctx* s_nixl_ctx_ptr;
+    if (threadIdx.x == 0)
+        s_nixl_ctx_ptr = reinterpret_cast<nixl_ep::gpu_nixl_ctx*>(
+            ld_acquire_sys_global(reinterpret_cast<const uint64_t*>(nixl_ctx_pp)));
+    __syncthreads();
+    auto nixl_ctx = *s_nixl_ctx_ptr;
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1016,7 +1032,7 @@ void combine(void* combined_x,
              int num_topk, int active_rank_bound, int num_experts_per_rank, int rank,
              bool use_logfmt, uint64_t timeout_cycles,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx) {
+             cudaStream_t stream, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx** nixl_ctx) {
     constexpr int kNumMaxTopk = 11;
     const int active_expert_bound = active_rank_bound * num_experts_per_rank;
     const int num_warp_groups = ceil_div(active_expert_bound, num_device_sms);
@@ -1143,16 +1159,33 @@ __forceinline__ __device__ void barrier(nixl_ep::gpu_nixl_ctx nixl_ctx, int* mas
 }
 
 template <int kNumThreads>
-__global__ void barrier_kernel(nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr, int* mask_buffer_ptr, uint64_t timeout_cycles) {
+__global__ void barrier_kernel(nixl_ep::gpu_nixl_ctx** nixl_ctx_pp, int* mask_buffer_ptr, uint64_t timeout_cycles) {
     const auto thread_id = static_cast<int>(threadIdx.x);
-    auto nixl_ctx = *nixl_ctx_ptr;
+    __shared__ nixl_ep::gpu_nixl_ctx* s_nixl_ctx_ptr;
+    if (thread_id == 0)
+        s_nixl_ctx_ptr = reinterpret_cast<nixl_ep::gpu_nixl_ctx*>(
+            ld_acquire_sys_global(reinterpret_cast<const uint64_t*>(nixl_ctx_pp)));
+    __syncthreads();
+    auto nixl_ctx = *s_nixl_ctx_ptr;
     barrier<kNumThreads>(nixl_ctx, mask_buffer_ptr, thread_id, timeout_cycles);
 }
 
-void barrier(nixl_ep::gpu_nixl_ctx* nixl_ctx, int* mask_buffer_ptr, uint64_t timeout_cycles, cudaStream_t stream) {
+void barrier(nixl_ep::gpu_nixl_ctx** nixl_ctx, int* mask_buffer_ptr, uint64_t timeout_cycles, cudaStream_t stream) {
     constexpr int kNumThreads = 32;
     SETUP_LAUNCH_CONFIG(1, kNumThreads, stream);
     LAUNCH_KERNEL(&cfg, barrier_kernel<kNumThreads>, nixl_ctx, mask_buffer_ptr, timeout_cycles);
+}
+
+__global__ void activate_ctx_kernel(nixl_ep::gpu_nixl_ctx** pp, nixl_ep::gpu_nixl_ctx* np) {
+    // Single release-store of an aligned 64-bit pointer: a concurrent datapath
+    // acquire-load of `*pp` observes either the old or the new slot, never a
+    // torn value, and also sees the fully-initialized slot contents (the
+    // staging cudaMemcpyAsync is ordered before this kernel on the same stream).
+    st_release_sys_global(reinterpret_cast<const uint64_t*>(pp), reinterpret_cast<uint64_t>(np));
+}
+
+void activate_ctx(nixl_ep::gpu_nixl_ctx** slot_pp, nixl_ep::gpu_nixl_ctx* new_active, cudaStream_t stream) {
+    activate_ctx_kernel<<<1, 1, 0, stream>>>(slot_pp, new_active);
 }
 } // namespace ep_kernels
 

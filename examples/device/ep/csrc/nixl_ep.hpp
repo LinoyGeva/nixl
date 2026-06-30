@@ -156,8 +156,24 @@ private:
     std::unique_ptr<NixlAgentInfo> nixl_agent_info;
     std::vector<NixlPeerInfo> nixl_peer_info;
     NixlPeerInfo my_peer_info;
-    nixl_ep::gpu_nixl_ctx gpu_ctx;
-    nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
+
+    // Double-indirect gpu_ctx for atomic, graph-safe scale switching.
+    // Kernels are launched with the STABLE `gpu_ctx_slot_pp` (a device
+    // gpu_nixl_ctx**), so a captured CUDA graph never needs re-capture. A scale
+    // builds a fresh ctx into the inactive slot and flips the inner pointer with
+    // a single concurrent release-store (see ep_kernels::activate_ctx). The
+    // displaced slot is reclaimed (releaseMemView + deferred agent teardown)
+    // only at the next quiescent mask update, so in-flight kernels never hit a
+    // freed view (no UAF).
+    nixl_ep::gpu_nixl_ctx host_ctx[2];                  // host mirror incl. mvh handles, per slot
+    nixl_ep::gpu_nixl_ctx* dev_slot[2] = {nullptr, nullptr};
+    nixl_ep::gpu_nixl_ctx** gpu_ctx_slot_pp = nullptr;  // stable launch arg; *pp == dev_slot[active_slot]
+    int active_slot = 0;
+    int pending_retire_slot = -1;                       // slot displaced by a flip, awaiting quiescent reclaim
+    bool slot_has_views[2] = {false, false};
+    std::vector<int> slot_pending_disconnect[2];        // deferred agent teardown, keyed by slot
+    at::cuda::CUDAStream control_stream;                // memcpy + flip stream, independent of comm_stream
+
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
 
@@ -169,8 +185,10 @@ private:
     void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
 
     void _nixl_ep_init(void);
-    void _nixl_ep_memory_views_create(void);
-    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_memory_views_create(int slot);
+    void _nixl_ep_memory_views_destroy(int slot);
+    void _flip_to(int staging);      // publish dev_slot[staging] as active (concurrent, no datapath sync)
+    void _retire_pending(void);      // reclaim the displaced slot; call only when datapath is quiescent
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
     void set_active_rank_bound(int bound);

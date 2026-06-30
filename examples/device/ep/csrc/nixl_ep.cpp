@@ -85,7 +85,8 @@ Buffer::Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int tim
         }()),
         rank(rank),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(at::cuda::getStreamFromPool(true)) {}
+        comm_stream(at::cuda::getStreamFromPool(true)),
+        control_stream(at::cuda::getStreamFromPool(true)) {}
 
 bool Buffer::_is_rank_connected(int rank_id) const {
     return rank_id == rank or std::find(remote_ranks.begin(), remote_ranks.end(), rank_id) != remote_ranks.end();
@@ -372,7 +373,7 @@ void Buffer::destroy() {
 
 void Buffer::barrier() {
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    ep_kernels::barrier(gpu_ctx_ptr, mask_buffer_ptr, timeout_cycles, compute_stream);
+    ep_kernels::barrier(gpu_ctx_slot_pp, mask_buffer_ptr, timeout_cycles, compute_stream);
 }
 
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
@@ -497,22 +498,30 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     if (!new_ranks.empty()) {
         // Release the GIL for the heavy, Python-free section (NIXL metadata
-        // exchange + in-place view rebuild + device sync). This lets a datapath
+        // exchange + slot staging + flip + device sync). This lets a datapath
         // thread keep launching dispatch/combine kernels concurrently, which is
         // both the realistic production behavior (a scale op must not stall the
         // datapath) and what lets the elastic stress test overlap in-flight
         // kernels with the view rebuild. All Python-object handling
         // (_ipc_handles_sync, MD conversion) has already completed above.
         pybind11::gil_scoped_release release;
-        _nixl_agents_connect(new_ranks, new_ranks_mds);
+        // Additive agent work -- never touches the active slot, so it is safe to
+        // run while the datapath reads the active slot concurrently.
+        _nixl_agents_connect(new_ranks, new_ranks_mds);   // appends new_ranks to remote_ranks
 
         _nixl_agents_peer_info_gather(new_ranks);
 
-        _nixl_ep_memory_views_destroy();
-
-        _nixl_ep_memory_views_create();
-
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Stage the new view set (including the new ranks) into the inactive
+        // slot and atomically flip to it. No datapath-stream sync: the flip is a
+        // single release-store, and the new ranks stay masked until the separate
+        // quiescent mask update below, so old vs new slot are behaviorally
+        // equivalent for any in-flight kernel.
+        int staging = active_slot ^ 1;
+        _nixl_ep_memory_views_create(staging);
+        _flip_to(staging);
+        // The displaced (old active) slot is reclaimed at the next quiescent
+        // mask update (update_mask_buffer below, or the application's explicit
+        // activate step when activate=False).
     }
 
     if (activate) {
@@ -530,7 +539,11 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
 
+    // Quiescent path: deactivating ranks is a mask change, so the application
+    // has stopped the datapath. Drain, then reclaim any slot left pending by a
+    // prior concurrent connect flip.
     CUDA_CHECK(cudaDeviceSynchronize());
+    _retire_pending();
 
     // Update mask buffer to mark ranks as inactive
     for (int removed_rank : remote_ranks_list) {
@@ -539,13 +552,8 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         update_mask_buffer(removed_rank, true);  // mask=true
     }
 
-    _nixl_ep_memory_views_destroy();
-
-    _nixl_agents_peer_info_cleanup(remote_ranks_list);
-
-    _nixl_agents_disconnect(remote_ranks_list);
-
-    // Remove ranks from remote_ranks vector (arbitrary order)
+    // Remove ranks from remote_ranks vector (arbitrary order) so the staged view
+    // set excludes them.
     for (int removed_rank : remote_ranks_list) {
         remote_ranks.erase(
             std::remove(remote_ranks.begin(), remote_ranks.end(), removed_rank),
@@ -553,7 +561,17 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         );
     }
 
-    _nixl_ep_memory_views_create();
+    // Stage the reduced view set into the inactive slot and flip. The old slot's
+    // views still describe the removed ranks; their releaseMemView and the agent
+    // teardown are deferred to _retire_pending so nothing is freed while a kernel
+    // might still reference it.
+    int staging = active_slot ^ 1;
+    _nixl_ep_memory_views_create(staging);
+    _flip_to(staging);
+    slot_pending_disconnect[pending_retire_slot] = remote_ranks_list;
+    // Already quiescent here, so reclaim the displaced slot immediately
+    // (releaseMemView + agent disconnect of the removed ranks).
+    _retire_pending();
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
@@ -759,7 +777,7 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                                  buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                  barrier_signal_ptrs_gpu, rank, comm_stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                 num_nvl_bytes, timeout_cycles, true, low_latency_mode, gpu_ctx);
+                                 num_nvl_bytes, timeout_cycles, true, low_latency_mode, host_ctx[active_slot]);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -782,7 +800,7 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                                    buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                    barrier_signal_ptrs_gpu, rank, comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                   num_nvl_bytes, timeout_cycles, low_latency_mode, gpu_ctx);
+                                   num_nvl_bytes, timeout_cycles, low_latency_mode, host_ctx[active_slot]);
 
         // Synchronize total received tokens and tokens per expert
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -866,7 +884,7 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
-                        comm_stream, num_channels, timeout_cycles, low_latency_mode, gpu_ctx);
+                        comm_stream, num_channels, timeout_cycles, low_latency_mode, host_ctx[active_slot]);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -981,7 +999,7 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                              barrier_signal_ptrs_gpu, rank, comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                             num_nvl_bytes, timeout_cycles, false, low_latency_mode, gpu_ctx);
+                             num_nvl_bytes, timeout_cycles, false, low_latency_mode, host_ctx[active_slot]);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1005,7 +1023,7 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
                        num_tokens, num_combined_tokens, hidden, num_topk,
                        rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                       rank, num_ranks, comm_stream, num_channels, timeout_cycles, low_latency_mode, gpu_ctx);
+                       rank, num_ranks, comm_stream, num_channels, timeout_cycles, low_latency_mode, host_ctx[active_slot]);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1126,7 +1144,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                use_fp8, round_scale, use_ue8m0,
                                timeout_cycles,
                                workspace, num_device_sms,
-                               launch_stream, phases, gpu_ctx_ptr);
+                               launch_stream, phases, gpu_ctx_slot_pp);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1227,7 +1245,7 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                               num_topk, active_rank_bound, num_experts_per_rank, rank,
                              use_logfmt, timeout_cycles,
                               workspace, num_device_sms,
-                              launch_stream, phases, zero_copy, gpu_ctx_ptr);
+                              launch_stream, phases, zero_copy, gpu_ctx_slot_pp);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1280,6 +1298,10 @@ void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
     if (!mask)
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
+    // A mask change is the application's quiescent sync point: reclaim the slot
+    // displaced by the preceding concurrent connect flip (releaseMemView, drain
+    // already guaranteed by the caller) before activating the new view set.
+    _retire_pending();
     active_ranks[rank_to_mask] = !mask;
     _refresh_active_rank_bound();
     ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
@@ -1318,7 +1340,14 @@ std::string Buffer::get_local_metadata() const {
     return metadata_blob;
 }
 
-void Buffer::_nixl_ep_memory_views_create(void) {
+void Buffer::_nixl_ep_memory_views_create(int slot) {
+    // Build a fresh set of memory views from the current host rank set into the
+    // INACTIVE `slot`'s host mirror, then publish the struct to that slot's
+    // device copy. The active slot is never mutated in place, so concurrent
+    // datapath kernels reading the active slot are unaffected (graph-safe).
+    EP_HOST_ASSERT(!slot_has_views[slot] && "staging slot must be retired before rebuild");
+    nixl_ep::gpu_nixl_ctx& ctx = host_ctx[slot];
+
     nixl_remote_dlist_t remote_descs(VRAM_SEG);
     nixl_remote_dlist_t barrier_descs(VRAM_SEG);
     nixl_local_dlist_t local_descs(VRAM_SEG);
@@ -1333,10 +1362,10 @@ void Buffer::_nixl_ep_memory_views_create(void) {
         barrier_descs.addDesc(nixlRemoteDesc((uintptr_t)nixl_peer_info[r].sync_buffer_ptr, max_num_ranks * sizeof(int), nixl_peer_info[r].device_id, remote_agent_name));
     }
 
-    EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(local_descs, gpu_ctx.local_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+    EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(local_descs, ctx.local_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
     if (!remote_ranks.empty()) {
-        EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(remote_descs, gpu_ctx.remote_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
-        EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(barrier_descs, gpu_ctx.barrier_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(remote_descs, ctx.remote_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(barrier_descs, ctx.barrier_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
 
         if (!low_latency_mode && max_num_ranks > NUM_MAX_NVL_PEERS) {
             nixl_remote_dlist_t ht_barrier_descs(VRAM_SEG);
@@ -1344,25 +1373,61 @@ void Buffer::_nixl_ep_memory_views_create(void) {
                 std::string remote_agent_name = remote_set.count(r) ? nixl_agent_info->remote_agent_names[r] : nixl_null_agent;
                 ht_barrier_descs.addDesc(nixlRemoteDesc((uintptr_t)nixl_peer_info[r].ht_barrier_ptr, sizeof(uint64_t), nixl_peer_info[r].device_id, remote_agent_name));
             }
-            EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(ht_barrier_descs, gpu_ctx.ht_barrier_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+            EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(ht_barrier_descs, ctx.ht_barrier_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
         }
     }
-    CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
+    slot_has_views[slot] = true;
+    // Publish the staged struct to the device slot, ordered before the flip on
+    // the same control_stream (the activate_ctx release-store then makes these
+    // writes visible to a concurrent acquire-load).
+    CUDA_CHECK(cudaMemcpyAsync(dev_slot[slot], &ctx, sizeof(ctx), cudaMemcpyHostToDevice, control_stream));
 }
 
-void Buffer::_nixl_ep_memory_views_destroy(void) {
-    if (gpu_ctx.local_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.local_mvh);
-    if (gpu_ctx.remote_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.remote_mvh);
-    if (gpu_ctx.barrier_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.barrier_mvh);
-    if (gpu_ctx.ht_barrier_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.ht_barrier_mvh);
-    gpu_ctx.local_mvh = nullptr;
-    gpu_ctx.remote_mvh = nullptr;
-    gpu_ctx.barrier_mvh = nullptr;
-    gpu_ctx.ht_barrier_mvh = nullptr;
+void Buffer::_nixl_ep_memory_views_destroy(int slot) {
+    nixl_ep::gpu_nixl_ctx& ctx = host_ctx[slot];
+    if (ctx.local_mvh) nixl_agent_info->agent->releaseMemView(ctx.local_mvh);
+    if (ctx.remote_mvh) nixl_agent_info->agent->releaseMemView(ctx.remote_mvh);
+    if (ctx.barrier_mvh) nixl_agent_info->agent->releaseMemView(ctx.barrier_mvh);
+    if (ctx.ht_barrier_mvh) nixl_agent_info->agent->releaseMemView(ctx.ht_barrier_mvh);
+    ctx.local_mvh = nullptr;
+    ctx.remote_mvh = nullptr;
+    ctx.barrier_mvh = nullptr;
+    ctx.ht_barrier_mvh = nullptr;
+    slot_has_views[slot] = false;
+}
+
+void Buffer::_flip_to(int staging) {
+    // Atomically publish dev_slot[staging] as active with a single release-store
+    // on control_stream. No datapath-stream sync: a concurrent acquire-load sees
+    // either the old or the new slot pointer, never a torn value. The previously
+    // active slot is recorded for reclamation at the next quiescent point.
+    ep_kernels::activate_ctx(gpu_ctx_slot_pp, dev_slot[staging], control_stream);
+    // Sync the control stream only (NOT the datapath streams) so the staged
+    // memcpy + flip have completed before we mutate host bookkeeping below.
+    CUDA_CHECK(cudaStreamSynchronize(control_stream));
+    pending_retire_slot = active_slot;
+    active_slot = staging;
+}
+
+void Buffer::_retire_pending(void) {
+    // Reclaim the slot displaced by the last flip. MUST be called only when the
+    // datapath is quiescent (the application synchronizes before a mask change),
+    // since this releases the slot's memory views and tears down agents that
+    // in-flight kernels may otherwise still reference.
+    if (pending_retire_slot < 0)
+        return;
+    int s = pending_retire_slot;
+    pending_retire_slot = -1;
+    _nixl_ep_memory_views_destroy(s);
+    if (!slot_pending_disconnect[s].empty()) {
+        _nixl_agents_peer_info_cleanup(slot_pending_disconnect[s]);
+        _nixl_agents_disconnect(slot_pending_disconnect[s]);
+        slot_pending_disconnect[s].clear();
+    }
 }
 
 void Buffer::_nixl_ep_init(void) {
-    gpu_ctx = {
+    host_ctx[0] = {
         .sync_buffer_ptr = sync_buffer_ptr,
         .sync_count_ptr = sync_count_ptr,
         .last_ht_barrier_counter = last_ht_barrier_counter,
@@ -1372,16 +1437,31 @@ void Buffer::_nixl_ep_init(void) {
         .num_rdma_ranks = num_rdma_ranks,
         .rank = rank,
     };
-    CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr, sizeof(gpu_nixl_ctx)));
-    CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
+    host_ctx[1] = host_ctx[0];  // same scalar fields; views filled in on first scale
+
+    CUDA_CHECK(cudaMalloc(&dev_slot[0], sizeof(gpu_nixl_ctx)));
+    CUDA_CHECK(cudaMalloc(&dev_slot[1], sizeof(gpu_nixl_ctx)));
+    CUDA_CHECK(cudaMemcpy(dev_slot[0], &host_ctx[0], sizeof(gpu_nixl_ctx), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev_slot[1], &host_ctx[1], sizeof(gpu_nixl_ctx), cudaMemcpyHostToDevice));
+
+    // The stable pointer-to-pointer baked into every kernel launch (and any
+    // captured CUDA graph). Only its CONTENTS change across scales.
+    CUDA_CHECK(cudaMalloc(&gpu_ctx_slot_pp, sizeof(gpu_nixl_ctx*)));
+    CUDA_CHECK(cudaMemcpy(gpu_ctx_slot_pp, &dev_slot[0], sizeof(gpu_nixl_ctx*), cudaMemcpyHostToDevice));
+
+    active_slot = 0;
+    pending_retire_slot = -1;
 }
 
 void Buffer::_nixl_ep_destroy(void) {
-    _nixl_ep_memory_views_destroy();
-    if (gpu_ctx_ptr != nullptr) {
-        cudaFree(gpu_ctx_ptr);
-        gpu_ctx_ptr = nullptr;
-    }
+    // Quiescent teardown: reclaim any pending slot, then release both slots.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    _retire_pending();
+    _nixl_ep_memory_views_destroy(0);
+    _nixl_ep_memory_views_destroy(1);
+    if (dev_slot[0] != nullptr) { cudaFree(dev_slot[0]); dev_slot[0] = nullptr; }
+    if (dev_slot[1] != nullptr) { cudaFree(dev_slot[1]); dev_slot[1] = nullptr; }
+    if (gpu_ctx_slot_pp != nullptr) { cudaFree(gpu_ctx_slot_pp); gpu_ctx_slot_pp = nullptr; }
 }
 
 void Buffer::_nixl_agent_init() {
