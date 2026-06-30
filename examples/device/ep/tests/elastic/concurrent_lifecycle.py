@@ -153,7 +153,6 @@ def run_overlap_stress(
     topk_weights,
     store,
     world_size: int,
-    burst: int = 32,
     switch_interval: float = 1e-5,
     warmup: float = 2.0,
 ):
@@ -184,34 +183,43 @@ def run_overlap_stress(
     errors: list = []
 
     def datapath_loop(stop: threading.Event):
-        # Keep async GPU work continuously in flight (no per-iter sync) so the
-        # comm-stream queue stays deep and overlaps connect_ranks. Send-only
-        # (return_recv_hook=True, hook never called): the SEND kernels still
+        # vLLM-realistic steady state: one dispatch -> combine pair at a time,
+        # consumed immediately (depth-1 sync). No burst-batching, so GPU memory
+        # stays flat (one pair ~28 MiB at the defaults) -- the loop can run for
+        # the whole concurrent window without OOM.
+        #
+        # This exposes the gpu_ctx use-after-free ONLY because connect_ranks now
+        # releases the GIL (py::gil_scoped_release): the datapath thread keeps
+        # launching view-touching SEND kernels *concurrently* with connect_ranks,
+        # so a kernel is in flight when connect_ranks hits its in-place
+        # releaseMemView + rebuild.
+        #
+        # Send-only (return_recv_hook=True, hook never called): SEND kernels still
         # dereference the shared views via RDMA, but nothing waits to *receive*
-        # from a peer -- avoiding cross-rank recv timeouts.
+        # (the churn rank runs no datapath, so a full recv would just time out).
         try:
             while not stop.is_set():
-                for _ in range(burst):
-                    recv_x, _, handle, _, _ = buffer.dispatch(
-                        x,
-                        topk_idx,
-                        num_tokens,
-                        num_experts,
-                        use_fp8=False,
-                        async_finish=False,
-                        return_recv_hook=True,
-                    )
-                    buffer.combine(
-                        recv_x,
-                        topk_idx,
-                        topk_weights,
-                        handle,
-                        async_finish=False,
-                        return_recv_hook=True,
-                    )
-                # Yield the GIL while the burst above is still draining on the
-                # GPU, so connect_ranks overlaps in-flight kernels.
-                time.sleep(0)
+                recv_x, _, handle, _, _ = buffer.dispatch(
+                    x,
+                    topk_idx,
+                    num_tokens,
+                    num_experts,
+                    use_fp8=False,
+                    async_finish=False,
+                    return_recv_hook=True,
+                )
+                buffer.combine(
+                    recv_x,
+                    topk_idx,
+                    topk_weights,
+                    handle,
+                    async_finish=False,
+                    return_recv_hook=True,
+                )
+                # Depth-1 consume: drain this pair before issuing the next, so
+                # memory stays flat. The wait releases the GIL, letting
+                # connect_ranks make progress while these kernels are in flight.
+                torch.cuda.synchronize()
         except Exception as exc:  # noqa: BLE001
             errors.append(("datapath", repr(exc)))
             stop.set()
@@ -387,7 +395,6 @@ def _worker(torch_rank: int, args: argparse.Namespace):
             topk_weights=None,
             store=tcp_store,
             world_size=world_size,
-            burst=args.burst,
             warmup=args.warmup,
         )
     else:
@@ -410,7 +417,6 @@ def _worker(torch_rank: int, args: argparse.Namespace):
             topk_weights=topk_weights,
             store=tcp_store,
             world_size=world_size,
-            burst=args.burst,
             warmup=args.warmup,
         )
 
@@ -456,15 +462,6 @@ def main():
         "and after it returns before the threads join (cool-down). This is the "
         "concurrent window in which dispatch/combine overlaps the view rebuild; "
         "the activation that follows runs synchronized with no datapath.",
-    )
-    parser.add_argument(
-        "--burst",
-        type=int,
-        default=256,
-        help="Async dispatch/combine pairs to enqueue before yielding the GIL. "
-        "This is the in-flight queue depth: it must be deep enough that "
-        "view-touching kernels are still draining while connect_ranks runs. "
-        "Crank to 512-1024 to widen the overlap window.",
     )
     parser.add_argument(
         "--tcp-server",

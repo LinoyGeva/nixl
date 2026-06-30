@@ -496,6 +496,14 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     }
 
     if (!new_ranks.empty()) {
+        // Release the GIL for the heavy, Python-free section (NIXL metadata
+        // exchange + in-place view rebuild + device sync). This lets a datapath
+        // thread keep launching dispatch/combine kernels concurrently, which is
+        // both the realistic production behavior (a scale op must not stall the
+        // datapath) and what lets the elastic stress test overlap in-flight
+        // kernels with the view rebuild. All Python-object handling
+        // (_ipc_handles_sync, MD conversion) has already completed above.
+        pybind11::gil_scoped_release release;
         _nixl_agents_connect(new_ranks, new_ranks_mds);
 
         _nixl_agents_peer_info_gather(new_ranks);
