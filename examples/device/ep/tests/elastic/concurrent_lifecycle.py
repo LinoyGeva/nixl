@@ -13,47 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Concurrent object-lifecycle stress test for the NIXL EP (low-latency) API.
+"""Serialized scale-lifecycle test for the NIXL EP (low-latency) API.
 
-This test interleaves two operations on a single ``Buffer`` from two threads:
+A new scale is never allowed to start before the previous one is fully
+activated. Each scale *cycle* is split into two strictly ordered phases on a
+single ``Buffer``:
 
-* a **datapath** loop (async ``dispatch`` -> ``combine``) on the main thread, and
-* an **async state update** (``connect_ranks`` / ``disconnect_ranks``) on a
-  background thread.
+* a **concurrent connect phase**: the datapath loop (``dispatch`` -> ``combine``)
+  runs on a background thread while the control thread rebuilds the shared
+  memory views via ``connect_ranks(activate=False)``. The freshly connected
+  ranks stay masked, so the scale is *staged* but not yet live. This is the only
+  window in which datapath and control overlap. The threads split a few seconds
+  (``--warmup``) before ``connect_ranks`` starts -- so the async GPU datapath is
+  already continuously in flight -- and re-join a few seconds after it returns.
 
-It is a *trigger* test: run against the current (unfixed) tree it is expected to
-provoke the ``gpu_ctx``-lifetime use-after-free. ``connect_ranks`` runs
-``_nixl_ep_memory_views_destroy()`` -> ``releaseMemView()`` on the shared
-``local_mvh`` / ``remote_mvh`` / ``barrier_mvh`` handles *before* its trailing
-``cudaDeviceSynchronize()`` (``nixl_ep.cpp``), while datapath kernels that
-snapshotted those same handles are still in flight on the GPU.
+* a **synchronized activate phase**: once the threads have joined, the device is
+  drained to a quiescent point (``torch.cuda.synchronize()``). With no datapath
+  in flight, the control thread *activates* the scale by flipping the mask
+  (``update_mask_buffer(..., mask=False)``), then releases the old ``gpu_ctx``
+  views (``disconnect_ranks``). Because the device is quiescent, this teardown
+  can no longer race in-flight kernels.
 
-Why this works despite the GIL: the collision is on the *device*, not the host.
-``connect_ranks`` does not release the GIL, so the strategy is not host
-parallelism -- it is keeping async GPU datapath work continuously in flight
-(``async_finish=True``, no per-iteration synchronize) so that whenever the
-control thread lands a ``releaseMemView`` there is always a kernel mid-flight
-referencing the handle being freed.
+So per cycle: ``connect_ranks`` overlaps the datapath, the threads join, then the
+activation (and the quiescent release of the old context) runs alone -- over and
+over for ``--num-cycles`` scale rounds.
 
 Topology: ``world_size`` ranks. Ranks ``[1, world_size)`` form the stable
 ``base`` set that runs the datapath and stays connected; rank ``0`` is the
 ``churn`` rank, repeatedly connected and disconnected. The churn rank is the
 *lowest* index on purpose: ``active_rank_bound`` is recomputed live as the
 highest active rank index + 1, so churning a top-index rank would oscillate the
-bound and trip the datapath's ``num_experts`` asserts (the active_rank_bound
-race). Keeping the top index permanently active pins the bound, isolating the
-gpu_ctx view-lifetime use-after-free. Reconnecting the churn rank still forces
-the shared views to be torn down and rebuilt every cycle, racing the datapath.
+bound and trip the datapath's ``num_experts`` asserts. Keeping the top index
+permanently active pins the bound.
 
-Run (>=4 ranks recommended, low-latency mode) under compute-sanitizer to surface
-the use-after-free deterministically::
+Run (>=4 ranks recommended, low-latency mode), optionally under
+compute-sanitizer::
 
     compute-sanitizer --tool memcheck \\
         .venv/bin/python concurrent_lifecycle.py --num-processes 4
-
-On the unfixed tree expect an invalid device access inside dispatch/combine
-(freed ``remote_mvh`` / ``barrier_mvh``), or a CUDA error raised by the final
-``torch.cuda.synchronize()``.
 """
 
 import argparse
@@ -158,39 +155,43 @@ def run_overlap_stress(
     world_size: int,
     burst: int = 32,
     switch_interval: float = 1e-5,
-    cycle_pause: float = 0.0,
+    warmup: float = 2.0,
 ):
-    """Interleave the datapath and the connect/disconnect control path.
+    """Run ``num_cycles`` serialized scale cycles.
 
-    Every rank (base and churn) runs ``num_cycles`` connect/disconnect cycles.
+    Each cycle has two strictly ordered phases so a new scale never starts
+    before the previous one is fully activated:
+
+    1. **concurrent connect**: a background datapath thread runs
+       ``dispatch``/``combine`` while the control (main) thread rebuilds the
+       shared views via ``connect_ranks(activate=False)``. The threads split
+       ``warmup`` seconds before ``connect_ranks`` (so the async GPU datapath is
+       already in flight) and re-join ``warmup`` seconds after it returns.
+    2. **synchronized activate**: with the datapath joined and the device drained
+       to a quiescent point, the control thread unmasks the freshly connected
+       ranks (``update_mask_buffer(..., mask=False)``) and then releases the old
+       context (``disconnect_ranks``).
+
     A per-cycle TCPStore barrier keeps all ranks in lockstep so the connect's
-    NIXL metadata rendezvous always resolves -- without it, a rank that runs
-    ahead (e.g. the churn rank, which has no datapath to drain) finishes its
-    cycles and stops publishing metadata, stranding slower ranks in connect.
+    NIXL metadata rendezvous always resolves; a second barrier gates the
+    quiescent activate so every rank flips the mask together.
 
-    Returns a list of ``(thread_name, error_repr)`` captured from either thread.
+    Returns a list of ``(phase, error_repr)`` captured from either thread.
     """
     prev_interval = sys.getswitchinterval()
     sys.setswitchinterval(switch_interval)  # force frequent GIL handoff
 
-    stop = threading.Event()
     errors: list = []
-    n_threads = 2 if run_datapath else 1
-    start = threading.Barrier(n_threads)
 
-    def datapath_loop():
-        # READER: keep async GPU work continuously in flight (no per-iter sync),
-        # so the comm-stream queue stays deep and overlaps every connect.
-        start.wait()
+    def datapath_loop(stop: threading.Event):
+        # Keep async GPU work continuously in flight (no per-iter sync) so the
+        # comm-stream queue stays deep and overlaps connect_ranks. Send-only
+        # (return_recv_hook=True, hook never called): the SEND kernels still
+        # dereference the shared views via RDMA, but nothing waits to *receive*
+        # from a peer -- avoiding cross-rank recv timeouts.
         try:
             while not stop.is_set():
                 for _ in range(burst):
-                    # Send-only (return_recv_hook=True, hook never called): the
-                    # SEND kernels still dereference the shared views via RDMA,
-                    # so the connect-time releaseMemView still races them, but
-                    # nothing waits to *receive* from a peer -- avoiding the
-                    # cross-rank recv timeouts that a non-lockstep multi-rank LL
-                    # datapath would otherwise hit.
                     recv_x, _, handle, _, _ = buffer.dispatch(
                         x,
                         topk_idx,
@@ -209,52 +210,84 @@ def run_overlap_stress(
                         return_recv_hook=True,
                     )
                 # Yield the GIL while the burst above is still draining on the
-                # GPU, letting the control thread land a connect in the window.
+                # GPU, so connect_ranks overlaps in-flight kernels.
                 time.sleep(0)
         except Exception as exc:  # noqa: BLE001
             errors.append(("datapath", repr(exc)))
             stop.set()
 
-    def control_loop():
-        # WRITER: repeatedly destroy + recreate the SHARED memory views.
-        # activate=False keeps the churn rank masked; combined with anchoring
-        # the top index, this isolates the view UAF from the bound/mask races.
-        start.wait()
-        try:
-            for i in range(num_cycles):
-                # Lockstep: all ranks enter cycle i together, so the connect
-                # rendezvous below cannot strand a rank that fell behind. The
-                # barrier is bounded, so a wedged/failed peer ends the loop
-                # instead of hanging it.
-                if not _store_barrier(store, world_size, f"cycle_{i}"):
-                    errors.append(("control", f"barrier cycle_{i}: peer desync/abort"))
+    try:
+        for i in range(num_cycles):
+            # Lockstep: all ranks enter cycle i together, so the connect
+            # rendezvous below cannot strand a rank that fell behind. Bounded,
+            # so a wedged/failed peer ends the loop instead of hanging it.
+            if not _store_barrier(store, world_size, f"cycle_{i}"):
+                errors.append(("control", f"barrier cycle_{i}: peer desync/abort"))
+                _signal_abort(store)
+                break
+
+            # ---- Concurrent connect phase: connect_ranks || datapath. ----
+            stop = threading.Event()
+            dp = None
+            if run_datapath:
+                dp = threading.Thread(
+                    target=datapath_loop, args=(stop,), name="datapath"
+                )
+                dp.start()
+                # Warm up: let the datapath get continuously in flight before the
+                # scale's view rebuild starts.
+                time.sleep(warmup)
+
+            try:
+                # New views built while datapath kernels are still in flight;
+                # activate=False keeps the new ranks masked (staged, not live).
+                buffer.connect_ranks(toggle_ranks, activate=False)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("control", repr(exc)))
+                stop.set()
+                if dp is not None:
+                    dp.join()
+                _signal_abort(store)
+                break
+
+            # Cool down: keep the datapath in flight a bit after connect_ranks
+            # returns, then join so the activation runs alone.
+            if dp is not None:
+                time.sleep(warmup)
+                stop.set()
+                dp.join()
+                if errors:  # datapath faulted during the concurrent window
                     _signal_abort(store)
                     break
-                try:
-                    buffer.connect_ranks(toggle_ranks, activate=False)  # new views
-                    buffer.disconnect_ranks(toggle_ranks)  # releaseMemView on old
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(("control", repr(exc)))
-                    _signal_abort(store)  # release peers stuck at the next barrier
-                    break
-                if cycle_pause:
-                    time.sleep(cycle_pause)
-        finally:
-            stop.set()
 
-    threads = [threading.Thread(target=control_loop, name="control")]
-    if run_datapath:
-        threads.append(threading.Thread(target=datapath_loop, name="datapath"))
+            # ---- Synchronized activate phase: quiescent, no datapath. ----
+            # Drain any deferred device fault and reach a quiescent point before
+            # flipping the mask, so the previous scale is fully settled first.
+            torch.cuda.synchronize()
+            if not _store_barrier(store, world_size, f"activate_{i}"):
+                errors.append(
+                    ("control", f"barrier activate_{i}: peer desync/abort")
+                )
+                _signal_abort(store)
+                break
 
-    try:
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        # Surface any device fault deferred behind the async stream.
-        torch.cuda.synchronize()
+            try:
+                # Activate the scale: unmask the freshly connected ranks. The
+                # device is quiescent, so the old gpu_ctx views can now be
+                # released safely.
+                for r in toggle_ranks:
+                    if r != buffer.rank:
+                        buffer.update_mask_buffer(r, mask=False)
+                # Quiescent teardown of the old context (scale back down).
+                buffer.disconnect_ranks(toggle_ranks)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("control", repr(exc)))
+                _signal_abort(store)  # release peers stuck at the next barrier
+                break
     finally:
         sys.setswitchinterval(prev_interval)
+        # Surface any device fault deferred behind the async stream.
+        torch.cuda.synchronize()
 
     return errors
 
@@ -355,6 +388,7 @@ def _worker(torch_rank: int, args: argparse.Namespace):
             store=tcp_store,
             world_size=world_size,
             burst=args.burst,
+            warmup=args.warmup,
         )
     else:
         x, topk_idx, topk_weights = _make_datapath_inputs(
@@ -377,6 +411,7 @@ def _worker(torch_rank: int, args: argparse.Namespace):
             store=tcp_store,
             world_size=world_size,
             burst=args.burst,
+            warmup=args.warmup,
         )
 
     _store_barrier(tcp_store, world_size, "teardown")
@@ -409,8 +444,18 @@ def main():
     parser.add_argument(
         "--num-cycles",
         type=int,
-        default=100,
-        help="Number of connect/disconnect cycles on the control thread",
+        default=20,
+        help="Number of serialized scale cycles (connect || datapath, join, "
+        "then synchronized activate + quiescent disconnect)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=float,
+        default=2.0,
+        help="Seconds the datapath runs alone before connect_ranks (warm-up) "
+        "and after it returns before the threads join (cool-down). This is the "
+        "concurrent window in which dispatch/combine overlaps the view rebuild; "
+        "the activation that follows runs synchronized with no datapath.",
     )
     parser.add_argument(
         "--burst",
@@ -418,8 +463,8 @@ def main():
         default=256,
         help="Async dispatch/combine pairs to enqueue before yielding the GIL. "
         "This is the in-flight queue depth: it must be deep enough that "
-        "view-touching kernels are still draining when connect runs "
-        "releaseMemView. Crank to 512-1024 to widen the race window.",
+        "view-touching kernels are still draining while connect_ranks runs. "
+        "Crank to 512-1024 to widen the overlap window.",
     )
     parser.add_argument(
         "--tcp-server",
