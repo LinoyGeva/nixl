@@ -20,12 +20,10 @@ activated. Each scale *cycle* is split into two strictly ordered phases on a
 single ``Buffer``:
 
 * a **concurrent connect phase**: the datapath loop (``dispatch`` -> ``combine``)
-  runs on a background thread while the control thread rebuilds the shared
-  memory views via ``connect_ranks(activate=False)``. The freshly connected
-  ranks stay masked, so the scale is *staged* but not yet live. This is the only
-  window in which datapath and control overlap. The threads split a few seconds
-  (``--warmup``) before ``connect_ranks`` starts -- so the async GPU datapath is
-  already continuously in flight -- and re-join a few seconds after it returns.
+  runs on a background thread while the control thread stages a new scale via
+  ``connect_ranks(activate=False)`` (agent metadata + inactive-slot prepMemView).
+  The freshly connected ranks stay masked, so the scale is *staged* but not yet
+  live. The slot flip happens only in the activate phase below.
 
 * a **synchronized activate phase**: once the threads have joined, the device is
   drained to a quiescent point (``torch.cuda.synchronize()``). With no datapath
@@ -188,11 +186,9 @@ def run_overlap_stress(
         # stays flat (one pair ~28 MiB at the defaults) -- the loop can run for
         # the whole concurrent window without OOM.
         #
-        # This exposes the gpu_ctx use-after-free ONLY because connect_ranks now
-        # releases the GIL (py::gil_scoped_release): the datapath thread keeps
-        # launching view-touching SEND kernels *concurrently* with connect_ranks,
-        # so a kernel is in flight when connect_ranks hits its in-place
-        # releaseMemView + rebuild.
+        # Concurrent connect_ranks (activate=False) overlaps only agent metadata
+        # exchange and inactive-slot prepMemView with the datapath; the slot flip
+        # and releaseMemView of the old slot happen at the quiescent activate step.
         #
         # Send-only (return_recv_hook=True, hook never called): SEND kernels still
         # dereference the shared views via RDMA, but nothing waits to *receive*

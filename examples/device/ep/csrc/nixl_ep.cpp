@@ -498,30 +498,17 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     if (!new_ranks.empty()) {
         // Release the GIL for the heavy, Python-free section (NIXL metadata
-        // exchange + slot staging + flip + device sync). This lets a datapath
-        // thread keep launching dispatch/combine kernels concurrently, which is
-        // both the realistic production behavior (a scale op must not stall the
-        // datapath) and what lets the elastic stress test overlap in-flight
-        // kernels with the view rebuild. All Python-object handling
-        // (_ipc_handles_sync, MD conversion) has already completed above.
+        // exchange + inactive-slot view staging). This lets a datapath thread
+        // keep launching dispatch/combine kernels concurrently. View creation
+        // writes only into the inactive slot; the slot flip (activate) is
+        // deferred to the quiescent update_mask_buffer path when activate=false.
         pybind11::gil_scoped_release release;
-        // Additive agent work -- never touches the active slot, so it is safe to
-        // run while the datapath reads the active slot concurrently.
-        _nixl_agents_connect(new_ranks, new_ranks_mds);   // appends new_ranks to remote_ranks
-
+        _nixl_agents_connect(new_ranks, new_ranks_mds);
         _nixl_agents_peer_info_gather(new_ranks);
+        _stage_views_for_connect();
 
-        // Stage the new view set (including the new ranks) into the inactive
-        // slot and atomically flip to it. No datapath-stream sync: the flip is a
-        // single release-store, and the new ranks stay masked until the separate
-        // quiescent mask update below, so old vs new slot are behaviorally
-        // equivalent for any in-flight kernel.
-        int staging = active_slot ^ 1;
-        _nixl_ep_memory_views_create(staging);
-        _flip_to(staging);
-        // The displaced (old active) slot is reclaimed at the next quiescent
-        // mask update (update_mask_buffer below, or the application's explicit
-        // activate step when activate=False).
+        if (activate)
+            _commit_staged_views();
     }
 
     if (activate) {
@@ -541,8 +528,9 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
 
     // Quiescent path: deactivating ranks is a mask change, so the application
     // has stopped the datapath. Drain, then reclaim any slot left pending by a
-    // prior concurrent connect flip.
+    // prior connect that never activated, or by a prior flip.
     CUDA_CHECK(cudaDeviceSynchronize());
+    _discard_pending_staged_views();
     _retire_pending();
 
     // Update mask buffer to mark ranks as inactive
@@ -1298,9 +1286,10 @@ void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
     if (!mask)
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
-    // A mask change is the application's quiescent sync point: reclaim the slot
-    // displaced by the preceding concurrent connect flip (releaseMemView, drain
-    // already guaranteed by the caller) before activating the new view set.
+    // Quiescent activate: flip to the inactive slot staged by connect_ranks,
+    // then reclaim the displaced active slot before unmasking.
+    if (!mask)
+        _commit_staged_views();
     _retire_pending();
     active_ranks[rank_to_mask] = !mask;
     _refresh_active_rank_bound();
@@ -1377,9 +1366,9 @@ void Buffer::_nixl_ep_memory_views_create(int slot) {
         }
     }
     slot_has_views[slot] = true;
-    // Publish the staged struct to the device slot, ordered before the flip on
-    // the same control_stream (the activate_ctx release-store then makes these
-    // writes visible to a concurrent acquire-load).
+    // Publish the staged struct to the device slot on control_stream. For
+    // activate=false connects this may complete long before the quiescent flip;
+    // _commit_staged_views() drains the device before calling _flip_to().
     CUDA_CHECK(cudaMemcpyAsync(dev_slot[slot], &ctx, sizeof(ctx), cudaMemcpyHostToDevice, control_stream));
 }
 
@@ -1396,11 +1385,38 @@ void Buffer::_nixl_ep_memory_views_destroy(int slot) {
     slot_has_views[slot] = false;
 }
 
+void Buffer::_stage_views_for_connect() {
+    // Build fresh views into the inactive slot only. Datapath kernels keep
+    // reading the active slot; no flip and no releaseMemView here.
+    if (pending_view_commit)
+        _discard_pending_staged_views();
+    int staging = active_slot ^ 1;
+    _nixl_ep_memory_views_create(staging);
+    pending_staging_slot = staging;
+    pending_view_commit = true;
+}
+
+void Buffer::_commit_staged_views() {
+    if (!pending_view_commit)
+        return;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    _flip_to(pending_staging_slot);
+    pending_view_commit = false;
+    pending_staging_slot = -1;
+}
+
+void Buffer::_discard_pending_staged_views() {
+    if (!pending_view_commit)
+        return;
+    _nixl_ep_memory_views_destroy(pending_staging_slot);
+    pending_view_commit = false;
+    pending_staging_slot = -1;
+}
+
 void Buffer::_flip_to(int staging) {
-    // Atomically publish dev_slot[staging] as active with a single release-store
-    // on control_stream. No datapath-stream sync: a concurrent acquire-load sees
-    // either the old or the new slot pointer, never a torn value. The previously
-    // active slot is recorded for reclamation at the next quiescent point.
+    // Release-store dev_slot[staging] as the active inner pointer. Must run only
+    // when the datapath is quiescent (_commit_staged_views syncs first). The
+    // displaced slot is reclaimed via _retire_pending at the next mask update.
     ep_kernels::activate_ctx(gpu_ctx_slot_pp, dev_slot[staging], control_stream);
     // Sync the control stream only (NOT the datapath streams) so the staged
     // memcpy + flip have completed before we mutate host bookkeeping below.
@@ -1410,10 +1426,9 @@ void Buffer::_flip_to(int staging) {
 }
 
 void Buffer::_retire_pending(void) {
-    // Reclaim the slot displaced by the last flip. MUST be called only when the
-    // datapath is quiescent (the application synchronizes before a mask change),
-    // since this releases the slot's memory views and tears down agents that
-    // in-flight kernels may otherwise still reference.
+    // Reclaim the slot displaced by the last flip (releaseMemView). Caller must
+    // have made the datapath quiescent; _commit_staged_views() issues a device
+    // sync before flip, and disconnect_ranks() syncs at entry.
     if (pending_retire_slot < 0)
         return;
     int s = pending_retire_slot;
