@@ -172,8 +172,8 @@ private:
     int pending_retire_slot = -1;                       // slot displaced by a flip, awaiting quiescent reclaim
     bool slot_has_views[2] = {false, false};
     std::vector<int> slot_pending_disconnect[2];        // deferred agent teardown, keyed by slot
-    bool pending_view_commit = false;                   // inactive slot has staged views awaiting flip
-    int pending_staging_slot = -1;                      // slot index built by connect, flipped at activate
+    bool pending_view_commit = false;                   // connect done; prepMemView+flip deferred
+    int pending_staging_slot = -1;                      // inactive slot (-1 until prepMemView at commit)
     at::cuda::CUDAStream control_stream;                // memcpy + flip stream, independent of comm_stream
 
     uint64_t* last_ht_barrier_counter = nullptr;
@@ -190,9 +190,8 @@ private:
     void _nixl_ep_memory_views_create(int slot);
     void _nixl_ep_memory_views_destroy(int slot);
     void _flip_to(int staging);      // release-store active slot pointer (call when datapath quiescent)
-    void _stage_views_for_connect();   // prepMemView into inactive slot (safe concurrent with datapath)
-    void _commit_staged_views();     // flip to staged slot; call only when datapath is quiescent
-    void _discard_pending_staged_views();  // tear down uncommitted staging (e.g. disconnect w/o activate)
+    void _commit_staged_views();     // quiescent prepMemView + flip; call at activate
+    void _discard_pending_staged_views();  // tear down uncommitted connect (e.g. disconnect w/o activate)
     void _retire_pending(void);      // reclaim the displaced slot; call only when datapath is quiescent
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;

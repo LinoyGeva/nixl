@@ -20,10 +20,9 @@ activated. Each scale *cycle* is split into two strictly ordered phases on a
 single ``Buffer``:
 
 * a **concurrent connect phase**: the datapath loop (``dispatch`` -> ``combine``)
-  runs on a background thread while the control thread stages a new scale via
-  ``connect_ranks(activate=False)`` (agent metadata + inactive-slot prepMemView).
-  The freshly connected ranks stay masked, so the scale is *staged* but not yet
-  live. The slot flip happens only in the activate phase below.
+  runs on a background thread while the control thread stages agent metadata via
+  ``connect_ranks(activate=False)``. ``prepMemView`` and the slot flip are
+  deferred to the quiescent activate phase below.
 
 * a **synchronized activate phase**: once the threads have joined, the device is
   drained to a quiescent point (``torch.cuda.synchronize()``). With no datapath
@@ -186,9 +185,9 @@ def run_overlap_stress(
         # stays flat (one pair ~28 MiB at the defaults) -- the loop can run for
         # the whole concurrent window without OOM.
         #
-        # Concurrent connect_ranks (activate=False) overlaps only agent metadata
-        # exchange and inactive-slot prepMemView with the datapath; the slot flip
-        # and releaseMemView of the old slot happen at the quiescent activate step.
+        # Concurrent connect_ranks (activate=False) overlaps only NIXL agent
+        # metadata exchange with the datapath. prepMemView and the slot flip run
+        # at the quiescent activate step (update_mask_buffer unmask).
         #
         # Send-only (return_recv_hook=True, hook never called): SEND kernels still
         # dereference the shared views via RDMA, but nothing waits to *receive*

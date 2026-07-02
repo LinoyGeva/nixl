@@ -497,15 +497,15 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     }
 
     if (!new_ranks.empty()) {
-        // Release the GIL for the heavy, Python-free section (NIXL metadata
-        // exchange + inactive-slot view staging). This lets a datapath thread
-        // keep launching dispatch/combine kernels concurrently. View creation
-        // writes only into the inactive slot; the slot flip (activate) is
-        // deferred to the quiescent update_mask_buffer path when activate=false.
+        // Release the GIL for NIXL metadata exchange only. prepMemView and the
+        // slot flip are deferred to the quiescent activate path (_commit_staged_views)
+        // because prepMemView touches shared agent/UCX state that in-flight
+        // dispatch/combine kernels use via the active slot.
         pybind11::gil_scoped_release release;
         _nixl_agents_connect(new_ranks, new_ranks_mds);
         _nixl_agents_peer_info_gather(new_ranks);
-        _stage_views_for_connect();
+        pending_staging_slot = -1;
+        pending_view_commit = true;
 
         if (activate)
             _commit_staged_views();
@@ -1385,21 +1385,15 @@ void Buffer::_nixl_ep_memory_views_destroy(int slot) {
     slot_has_views[slot] = false;
 }
 
-void Buffer::_stage_views_for_connect() {
-    // Build fresh views into the inactive slot only. Datapath kernels keep
-    // reading the active slot; no flip and no releaseMemView here.
-    if (pending_view_commit)
-        _discard_pending_staged_views();
-    int staging = active_slot ^ 1;
-    _nixl_ep_memory_views_create(staging);
-    pending_staging_slot = staging;
-    pending_view_commit = true;
-}
-
 void Buffer::_commit_staged_views() {
     if (!pending_view_commit)
         return;
     CUDA_CHECK(cudaDeviceSynchronize());
+    if (pending_staging_slot < 0) {
+        int staging = active_slot ^ 1;
+        _nixl_ep_memory_views_create(staging);
+        pending_staging_slot = staging;
+    }
     _flip_to(pending_staging_slot);
     pending_view_commit = false;
     pending_staging_slot = -1;
@@ -1408,7 +1402,8 @@ void Buffer::_commit_staged_views() {
 void Buffer::_discard_pending_staged_views() {
     if (!pending_view_commit)
         return;
-    _nixl_ep_memory_views_destroy(pending_staging_slot);
+    if (pending_staging_slot >= 0)
+        _nixl_ep_memory_views_destroy(pending_staging_slot);
     pending_view_commit = false;
     pending_staging_slot = -1;
 }
