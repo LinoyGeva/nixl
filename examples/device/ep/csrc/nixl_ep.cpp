@@ -179,10 +179,6 @@ int Buffer::_get_active_gpu_ctx_slot() const {
     return active_gpu_ctx_slot.load(std::memory_order_acquire);
 }
 
-nixl_ep::gpu_nixl_ctx* Buffer::_get_active_gpu_ctx_ptr() const {
-    return gpu_ctx_ptr_slots[_get_active_gpu_ctx_slot()];
-}
-
 void Buffer::_publish_active_gpu_ctx_slot(int slot) {
     EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
     auto* slot_ptr = gpu_ctx_ptr_slots[slot];
@@ -208,8 +204,35 @@ void Buffer::_mark_ll_launch(int slot, cudaStream_t stream) {
     cudaError_t status = cudaLaunchHostFunc(stream, ll_inflight_launch_done, cb_ctx);
     if (status != cudaSuccess) {
         delete cb_ctx;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(status);
     }
+}
+
+void Buffer::_stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in) {
+    EP_HOST_ASSERT(!scale_stage_pending && "staging already pending");
+    const int old_slot = _get_active_gpu_ctx_slot();
+    const int new_slot = 1 - old_slot;
+    _wait_for_slot_drain(new_slot);
+    _nixl_ep_memory_views_destroy_for_slot(new_slot);
+    _nixl_ep_memory_views_create_for_slot(new_slot);
+    staged_old_slot = old_slot;
+    staged_new_slot = new_slot;
+    staged_ranks = staged_ranks_in;
+    scale_stage_pending = true;
+}
+
+void Buffer::_publish_staged_slot_locked() {
+    EP_HOST_ASSERT(scale_stage_pending && "no staged slot to publish");
+    // Activation is assumed to happen at a quiescent point.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    _publish_active_gpu_ctx_slot(staged_new_slot);
+    _wait_for_slot_drain(staged_old_slot);
+    _nixl_ep_memory_views_destroy_for_slot(staged_old_slot);
+    scale_stage_pending = false;
+    staged_old_slot = -1;
+    staged_new_slot = -1;
+    staged_ranks.clear();
 }
 
 bool Buffer::_is_rank_connected(int rank_id) const {
@@ -601,11 +624,12 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
+    std::lock_guard<std::mutex> guard(reconfig_mu);
 
-    if (!low_latency_mode && num_nvl_bytes > 0) {
+    const bool use_staged_ll_flow = low_latency_mode;
+    if (!use_staged_ll_flow && num_nvl_bytes > 0) {
         EP_HOST_ASSERT(remote_ranks.empty() && "connect_ranks called more than once in high-throughput mode; elasticity is not yet supported");
     }
-    EP_HOST_ASSERT(low_latency_mode || activate);
 
     std::vector<int> new_ranks;
     std::vector<nixl_blob_t> new_ranks_mds;
@@ -630,29 +654,52 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     if (!new_ranks.empty()) {
         pybind11::gil_scoped_release release;
-        _nixl_agents_connect(new_ranks, new_ranks_mds);
+        try {
+            _nixl_agents_connect(new_ranks, new_ranks_mds);
+            _nixl_agents_peer_info_gather(new_ranks);
 
-        _nixl_agents_peer_info_gather(new_ranks);
+            write_phase_marker_if_enabled(rank);
+            maybe_sleep_before_destroy(rank);
+            maybe_wait_release_marker(rank);
 
-        write_phase_marker_if_enabled(rank);
-        maybe_sleep_before_destroy(rank);
-        maybe_wait_release_marker(rank);
-
-        const int old_slot = _get_active_gpu_ctx_slot();
-        const int new_slot = 1 - old_slot;
-        _wait_for_slot_drain(new_slot);
-        _nixl_ep_memory_views_destroy_for_slot(new_slot);
-        _nixl_ep_memory_views_create_for_slot(new_slot);
-        _publish_active_gpu_ctx_slot(new_slot);
-        _wait_for_slot_drain(old_slot);
-        _nixl_ep_memory_views_destroy_for_slot(old_slot);
+            if (scale_stage_pending) {
+                throw std::runtime_error("Scale stage already pending; activate previous stage first");
+            }
+            if (use_staged_ll_flow) {
+                _stage_inactive_slot_locked(new_ranks);
+            } else {
+                const int active_slot = _get_active_gpu_ctx_slot();
+                _nixl_ep_memory_views_destroy_for_slot(active_slot);
+                _nixl_ep_memory_views_create_for_slot(active_slot);
+                _publish_active_gpu_ctx_slot(active_slot);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        } catch (...) {
+            // Roll back newly connected ranks if staging fails before activation.
+            _nixl_agents_peer_info_cleanup(new_ranks);
+            _nixl_agents_disconnect(new_ranks);
+            for (int new_rank : new_ranks) {
+                remote_ranks.erase(
+                    std::remove(remote_ranks.begin(), remote_ranks.end(), new_rank),
+                    remote_ranks.end());
+            }
+            throw;
+        }
     }
 
     if (activate) {
-        for (int remote_rank : remote_ranks_list) {
+        std::vector<int> ranks_to_activate = remote_ranks_list;
+        if (use_staged_ll_flow && scale_stage_pending) {
+            ranks_to_activate = staged_ranks;
+            _publish_staged_slot_locked();
+        }
+        for (int remote_rank : ranks_to_activate) {
             if (remote_rank != rank)
                 update_mask_buffer(remote_rank, false);
         }
+    } else if (use_staged_ll_flow && !new_ranks.empty()) {
+        // Stage is now pending and must be activated before another topology stage.
+        EP_HOST_ASSERT(scale_stage_pending && "expected pending staged slot after connect");
     }
 
     // Ready to use
@@ -662,6 +709,11 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
+    std::lock_guard<std::mutex> guard(reconfig_mu);
+    if (scale_stage_pending) {
+        throw std::runtime_error("Scale stage already pending; activate previous stage first");
+    }
+    const bool use_staged_ll_flow = low_latency_mode;
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -683,15 +735,15 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
             remote_ranks.end()
         );
     }
-
-    const int old_slot = _get_active_gpu_ctx_slot();
-    const int new_slot = 1 - old_slot;
-    _wait_for_slot_drain(new_slot);
-    _nixl_ep_memory_views_destroy_for_slot(new_slot);
-    _nixl_ep_memory_views_create_for_slot(new_slot);
-    _publish_active_gpu_ctx_slot(new_slot);
-    _wait_for_slot_drain(old_slot);
-    _nixl_ep_memory_views_destroy_for_slot(old_slot);
+    if (use_staged_ll_flow) {
+        _stage_inactive_slot_locked({});
+        _publish_staged_slot_locked();
+    } else {
+        const int active_slot = _get_active_gpu_ctx_slot();
+        _nixl_ep_memory_views_destroy_for_slot(active_slot);
+        _nixl_ep_memory_views_create_for_slot(active_slot);
+        _publish_active_gpu_ctx_slot(active_slot);
+    }
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
