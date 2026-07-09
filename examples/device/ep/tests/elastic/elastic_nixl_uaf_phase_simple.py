@@ -323,8 +323,10 @@ def _worker(_: int, args: argparse.Namespace):
                 # The connect paths are already blocked in C++ waiting for the
                 # release marker with phase_timeout_s. Never hold warmup longer
                 # than that window, or churn/holder connect can timeout first.
+                # Keep a larger safety margin before phase timeout so the
+                # release marker write is not delayed past peer wait timeout.
                 warmup_deadline = min(
-                    now + args.sync_timeout_s, now + max(args.phase_timeout_s - 1.0, 0.0)
+                    now + args.sync_timeout_s, now + max(args.phase_timeout_s - 5.0, 0.0)
                 )
                 warmup_satisfied = False
                 while True:
