@@ -204,7 +204,14 @@ void Buffer::_mark_ll_launch(int slot, cudaStream_t stream) {
     cudaError_t status = cudaLaunchHostFunc(stream, ll_inflight_launch_done, cb_ctx);
     if (status != cudaSuccess) {
         delete cb_ctx;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaError_t sync_status = cudaStreamSynchronize(stream);
+        if (sync_status != cudaSuccess) {
+            throw std::runtime_error(
+                "cudaLaunchHostFunc failed: "
+                + std::string(cudaGetErrorString(status))
+                + "; additionally cudaStreamSynchronize failed: "
+                + std::string(cudaGetErrorString(sync_status)));
+        }
         CUDA_CHECK(status);
     }
 }
@@ -654,6 +661,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     if (!new_ranks.empty()) {
         pybind11::gil_scoped_release release;
+        bool staged_this_call = false;
         try {
             _nixl_agents_connect(new_ranks, new_ranks_mds);
             _nixl_agents_peer_info_gather(new_ranks);
@@ -667,6 +675,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
             }
             if (use_staged_ll_flow) {
                 _stage_inactive_slot_locked(new_ranks);
+                staged_this_call = true;
             } else {
                 const int active_slot = _get_active_gpu_ctx_slot();
                 _nixl_ep_memory_views_destroy_for_slot(active_slot);
@@ -682,6 +691,13 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
                 remote_ranks.erase(
                     std::remove(remote_ranks.begin(), remote_ranks.end(), new_rank),
                     remote_ranks.end());
+            }
+            if (staged_this_call) {
+                _nixl_ep_memory_views_destroy_for_slot(staged_new_slot);
+                scale_stage_pending = false;
+                staged_old_slot = -1;
+                staged_new_slot = -1;
+                staged_ranks.clear();
             }
             throw;
         }
