@@ -442,6 +442,10 @@ def _worker(_: int, args: argparse.Namespace):
         _log(args.verbose, rank, cycle, "post_up_barrier_done")
         if rank in (holder_rank, churn_rank):
             peer = churn_rank if rank == holder_rank else holder_rank
+            # Low-latency staged connect requires an explicit activate step
+            # before teardown disconnect.
+            buffer.connect_ranks([peer], activate=True)
+            _log(args.verbose, rank, cycle, f"activate_done peer={peer}")
             buffer.disconnect_ranks([peer])
             _log(args.verbose, rank, cycle, f"disconnect_done peer={peer}")
         _store_barrier(
