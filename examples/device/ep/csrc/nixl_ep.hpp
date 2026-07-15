@@ -35,7 +35,6 @@
 #include <vector>
 #include <string>
 #include <atomic>
-#include <mutex>
 
 #include <memory>
 #include "config.hpp"
@@ -164,7 +163,7 @@ private:
     nixl_ep::gpu_nixl_ctx** gpu_ctx_handle_ptr = nullptr;
     std::atomic<int> active_gpu_ctx_slot{0};
     std::atomic<int> ll_inflight_per_slot[kNumGpuCtxSlots];
-    std::mutex reconfig_mu;
+    std::atomic<bool> reconfig_in_progress{false};
     bool scale_stage_pending = false;
     int staged_new_slot = -1;
     int staged_old_slot = -1;
@@ -187,6 +186,7 @@ private:
     void _wait_for_slot_drain(int slot);
     void _mark_ll_launch(int slot, cudaStream_t stream);
     void _stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in);
+    void _clear_pending_stage_locked(bool disconnect_staged_ranks);
     void _publish_staged_slot_locked();
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;

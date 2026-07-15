@@ -62,6 +62,29 @@ struct LLInflightCallbackCtx {
     std::atomic<int>* counter;
 };
 
+class ReconfigInProgressGuard {
+public:
+    explicit ReconfigInProgressGuard(std::atomic<bool>& in_progress)
+        : in_progress_(in_progress) {
+        bool expected = false;
+        if (!in_progress_.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel)) {
+            throw std::runtime_error(
+                "Scale operation busy: another connect/disconnect is in progress");
+        }
+    }
+
+    ~ReconfigInProgressGuard() {
+        in_progress_.store(false, std::memory_order_release);
+    }
+
+    ReconfigInProgressGuard(const ReconfigInProgressGuard&) = delete;
+    ReconfigInProgressGuard& operator=(const ReconfigInProgressGuard&) = delete;
+
+private:
+    std::atomic<bool>& in_progress_;
+};
+
 void CUDART_CB ll_inflight_launch_done(void* user_data) {
     auto* ctx = reinterpret_cast<LLInflightCallbackCtx*>(user_data);
     ctx->counter->fetch_sub(1, std::memory_order_acq_rel);
@@ -227,6 +250,25 @@ void Buffer::_stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in
     staged_new_slot = new_slot;
     staged_ranks = staged_ranks_in;
     scale_stage_pending = true;
+}
+
+void Buffer::_clear_pending_stage_locked(bool disconnect_staged_ranks) {
+    EP_HOST_ASSERT(scale_stage_pending && "no pending stage to clear");
+    EP_HOST_ASSERT(staged_new_slot >= 0 && staged_new_slot < kNumGpuCtxSlots);
+    if (disconnect_staged_ranks && !staged_ranks.empty()) {
+        _nixl_agents_peer_info_cleanup(staged_ranks);
+        _nixl_agents_disconnect(staged_ranks);
+        for (int staged_rank : staged_ranks) {
+            remote_ranks.erase(
+                std::remove(remote_ranks.begin(), remote_ranks.end(), staged_rank),
+                remote_ranks.end());
+        }
+    }
+    _nixl_ep_memory_views_destroy_for_slot(staged_new_slot);
+    scale_stage_pending = false;
+    staged_old_slot = -1;
+    staged_new_slot = -1;
+    staged_ranks.clear();
 }
 
 void Buffer::_publish_staged_slot_locked() {
@@ -631,11 +673,15 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
-    std::lock_guard<std::mutex> guard(reconfig_mu);
+    ReconfigInProgressGuard guard(reconfig_in_progress);
 
     const bool use_staged_ll_flow = low_latency_mode;
     if (!use_staged_ll_flow && num_nvl_bytes > 0) {
         EP_HOST_ASSERT(remote_ranks.empty() && "connect_ranks called more than once in high-throughput mode; elasticity is not yet supported");
+    }
+    if (use_staged_ll_flow && scale_stage_pending && !activate) {
+        // Override a previously staged-but-not-activated topology with the latest request.
+        _clear_pending_stage_locked(/*disconnect_staged_ranks=*/true);
     }
 
     std::vector<int> new_ranks;
@@ -693,11 +739,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
                     remote_ranks.end());
             }
             if (staged_this_call) {
-                _nixl_ep_memory_views_destroy_for_slot(staged_new_slot);
-                scale_stage_pending = false;
-                staged_old_slot = -1;
-                staged_new_slot = -1;
-                staged_ranks.clear();
+                _clear_pending_stage_locked(/*disconnect_staged_ranks=*/false);
             }
             throw;
         }
@@ -725,7 +767,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
-    std::lock_guard<std::mutex> guard(reconfig_mu);
+    ReconfigInProgressGuard guard(reconfig_in_progress);
     if (scale_stage_pending) {
         throw std::runtime_error("Scale stage already pending; activate previous stage first");
     }
