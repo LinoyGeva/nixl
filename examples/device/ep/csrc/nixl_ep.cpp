@@ -83,6 +83,12 @@ namespace nixl_ep {
 
 namespace {
 
+// Skip if GIL already released
+#define NIXL_EP_RELEASE_GIL()                                                  \
+    std::optional<pybind11::gil_scoped_release> _nixl_ep_gil_release;          \
+    if (PyGILState_Check())                                                    \
+        _nixl_ep_gil_release.emplace()
+
 void sleep_ms(int milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 }
@@ -566,6 +572,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
         EP_HOST_ASSERT(remote_ranks.empty() && "connect_ranks called more than once in high-throughput mode; elasticity is not yet supported");
     }
     EP_HOST_ASSERT(low_latency_mode || activate);
+    NIXL_EP_RELEASE_GIL();
 
     std::vector<int> new_ranks;
     std::vector<nixl_blob_t> new_ranks_mds;
@@ -635,6 +642,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
+    NIXL_EP_RELEASE_GIL();
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -1149,6 +1157,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
                              bool async, bool return_recv_hook) {
     EP_HOST_ASSERT(low_latency_mode && "dispatch() requires low-latency mode (low_latency_mode=true)");
+    NIXL_EP_RELEASE_GIL();
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1263,6 +1272,7 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                             bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out) {
     EP_HOST_ASSERT(low_latency_mode && "combine() requires low-latency mode (low_latency_mode=true)");
+    NIXL_EP_RELEASE_GIL();
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1381,6 +1391,7 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
+    NIXL_EP_RELEASE_GIL();
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < max_num_ranks);
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
