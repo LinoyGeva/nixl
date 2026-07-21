@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 #include <optional>
+#include <filesystem>
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
@@ -86,6 +87,78 @@ bool gil_release_enabled() {
 
 void sleep_ms(int milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+bool phase_verbose_enabled() {
+    const char* value = std::getenv("NIXL_EP_TEST_PHASE_VERBOSE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void phase_log(int rank_id, const std::string& msg) {
+    if (!phase_verbose_enabled()) {
+        return;
+    }
+    std::cout << "[nixl_ep_phase] rank=" << rank_id
+              << " t=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count()
+              << " " << msg << "\n";
+    std::cout.flush();
+}
+
+int get_env_int(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return std::atoi(value);
+}
+
+void write_phase_marker_if_enabled(int rank_id) {
+    const char* marker_path = std::getenv("NIXL_EP_TEST_PHASE_ENTER_PATH");
+    if (marker_path == nullptr || marker_path[0] == '\0') {
+        return;
+    }
+    phase_log(rank_id, "phase_enter_marker_write_begin path=" + std::string(marker_path));
+    std::filesystem::path path(marker_path);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream out(marker_path, std::ios::trunc);
+    EP_HOST_ASSERT(out.is_open() && "Failed to open phase enter marker path");
+    out << "rank=" << rank_id << " pid=" << getpid() << "\n";
+    out.flush();
+    phase_log(rank_id, "phase_enter_marker_write_done");
+}
+
+void maybe_sleep_before_destroy(int rank_id) {
+    int sleep_ms_value = get_env_int("NIXL_EP_TEST_PHASE_SLEEP_MS", 0);
+    if (sleep_ms_value > 0) {
+        phase_log(rank_id, "phase_sleep_begin ms=" + std::to_string(sleep_ms_value));
+        sleep_ms(sleep_ms_value);
+        phase_log(rank_id, "phase_sleep_done");
+    }
+}
+
+void maybe_wait_release_marker(int rank_id) {
+    const char* release_path = std::getenv("NIXL_EP_TEST_PHASE_RELEASE_PATH");
+    if (release_path == nullptr || release_path[0] == '\0') {
+        return;
+    }
+    int timeout_ms = get_env_int("NIXL_EP_TEST_PHASE_TIMEOUT_MS", 30000);
+    EP_HOST_ASSERT(timeout_ms > 0 && "Phase gate timeout must be positive");
+    phase_log(rank_id, "phase_wait_release_begin path=" + std::string(release_path));
+    auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(timeout_ms);
+    while (access(release_path, F_OK) != 0) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            throw std::runtime_error(
+                "Timed out waiting for phase release marker: "
+                + std::string(release_path));
+        }
+        sleep_ms(1);
+    }
+    phase_log(rank_id, "phase_wait_release_done");
 }
 
 uint64_t milliseconds_to_cycles(uint64_t milliseconds, int device_clock_rate_khz) {
@@ -528,6 +601,10 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
         _nixl_agents_connect(new_ranks, new_ranks_mds);
 
         _nixl_agents_peer_info_gather(new_ranks);
+
+        write_phase_marker_if_enabled(rank);
+        maybe_sleep_before_destroy(rank);
+        maybe_wait_release_marker(rank);
 
         _nixl_ep_memory_views_destroy();
 
