@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <filesystem>
+#include <string>
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
@@ -57,6 +58,32 @@
 namespace nixl_ep {
 
 namespace {
+
+// Experiment toggle: when NIXL_EP_RELEASE_GIL=1, the low-latency dispatch/
+// combine and the elastic control ops release the GIL for the duration of the
+// C++ call (like ht_dispatch already does). This is OFF by default so there is
+// no behavior change unless explicitly enabled. Used to A/B whether releasing
+// the GIL lets a datapath thread and a control thread run truly in parallel
+// (and to expose GPU-context races that GIL serialization otherwise hides).
+bool gil_release_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("NIXL_EP_RELEASE_GIL");
+        return v != nullptr && (std::string(v) == "1" || std::string(v) == "true");
+    }();
+    return enabled;
+}
+
+// Conditionally release the GIL for the enclosing scope. The optional's
+// destructor reacquires the GIL on scope exit (before pybind builds the Python
+// return value or translates an exception), matching the gil_scoped_release
+// pattern used by ht_dispatch. The PyGILState_Check() guard keeps this safe for
+// functions that may be reached both directly from Python (GIL held -> release)
+// and internally from another already-released scope (GIL absent -> no-op),
+// e.g. disconnect_ranks() -> update_mask_buffer().
+#define NIXL_EP_MAYBE_RELEASE_GIL()                                            \
+    std::optional<pybind11::gil_scoped_release> _nixl_ep_gil_release;          \
+    if (gil_release_enabled() && PyGILState_Check())                           \
+        _nixl_ep_gil_release.emplace()
 
 struct LLInflightCallbackCtx {
     std::atomic<int>* counter;
@@ -674,6 +701,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
     ReconfigInProgressGuard guard(reconfig_in_progress);
+    NIXL_EP_MAYBE_RELEASE_GIL();
 
     const bool use_staged_ll_flow = low_latency_mode;
     if (!use_staged_ll_flow && num_nvl_bytes > 0) {
@@ -706,7 +734,6 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     }
 
     if (!new_ranks.empty()) {
-        pybind11::gil_scoped_release release;
         bool staged_this_call = false;
         try {
             _nixl_agents_connect(new_ranks, new_ranks_mds);
@@ -768,6 +795,7 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
     ReconfigInProgressGuard guard(reconfig_in_progress);
+    NIXL_EP_MAYBE_RELEASE_GIL();
     if (scale_stage_pending) {
         throw std::runtime_error("Scale stage already pending; activate previous stage first");
     }
@@ -1296,6 +1324,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
                              bool async, bool return_recv_hook) {
     EP_HOST_ASSERT(low_latency_mode && "dispatch() requires low-latency mode (low_latency_mode=true)");
+    NIXL_EP_MAYBE_RELEASE_GIL();
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1418,6 +1447,7 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                             bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out) {
     EP_HOST_ASSERT(low_latency_mode && "combine() requires low-latency mode (low_latency_mode=true)");
+    NIXL_EP_MAYBE_RELEASE_GIL();
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1544,6 +1574,7 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
+    NIXL_EP_MAYBE_RELEASE_GIL();
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < max_num_ranks);
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
