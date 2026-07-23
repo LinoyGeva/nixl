@@ -85,10 +85,6 @@ bool gil_release_enabled() {
     if (gil_release_enabled() && PyGILState_Check())                           \
         _nixl_ep_gil_release.emplace()
 
-struct LLInflightCallbackCtx {
-    std::atomic<int>* counter;
-};
-
 class ReconfigInProgressGuard {
 public:
     explicit ReconfigInProgressGuard(std::atomic<bool>& in_progress)
@@ -111,12 +107,6 @@ public:
 private:
     std::atomic<bool>& in_progress_;
 };
-
-void CUDART_CB ll_inflight_launch_done(void* user_data) {
-    auto* ctx = reinterpret_cast<LLInflightCallbackCtx*>(user_data);
-    ctx->counter->fetch_sub(1, std::memory_order_acq_rel);
-    delete ctx;
-}
 
 void sleep_ms(int milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
@@ -219,11 +209,7 @@ Buffer::Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int tim
         }()),
         rank(rank),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(at::cuda::getStreamFromPool(true)) {
-    for (int slot = 0; slot < kNumGpuCtxSlots; ++slot) {
-        ll_inflight_per_slot[slot].store(0, std::memory_order_relaxed);
-    }
-}
+        comm_stream(at::cuda::getStreamFromPool(true)) {}
 
 int Buffer::_get_active_gpu_ctx_slot() const {
     return active_gpu_ctx_slot.load(std::memory_order_acquire);
@@ -237,40 +223,10 @@ void Buffer::_publish_active_gpu_ctx_slot(int slot) {
     active_gpu_ctx_slot.store(slot, std::memory_order_release);
 }
 
-void Buffer::_wait_for_slot_drain(int slot) {
-    EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (ll_inflight_per_slot[slot].load(std::memory_order_acquire) > 0) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            throw std::runtime_error("Timed out waiting for LL inflight kernels to drain");
-        }
-        sleep_ms(1);
-    }
-}
-
-void Buffer::_mark_ll_launch(int slot, cudaStream_t stream) {
-    EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
-    auto* cb_ctx = new LLInflightCallbackCtx{&ll_inflight_per_slot[slot]};
-    cudaError_t status = cudaLaunchHostFunc(stream, ll_inflight_launch_done, cb_ctx);
-    if (status != cudaSuccess) {
-        delete cb_ctx;
-        cudaError_t sync_status = cudaStreamSynchronize(stream);
-        if (sync_status != cudaSuccess) {
-            throw std::runtime_error(
-                "cudaLaunchHostFunc failed: "
-                + std::string(cudaGetErrorString(status))
-                + "; additionally cudaStreamSynchronize failed: "
-                + std::string(cudaGetErrorString(sync_status)));
-        }
-        CUDA_CHECK(status);
-    }
-}
-
 void Buffer::_stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in) {
     EP_HOST_ASSERT(!scale_stage_pending && "staging already pending");
     const int old_slot = _get_active_gpu_ctx_slot();
     const int new_slot = 1 - old_slot;
-    _wait_for_slot_drain(new_slot);
     _nixl_ep_memory_views_destroy_for_slot(new_slot);
     _nixl_ep_memory_views_create_for_slot(new_slot);
     staged_old_slot = old_slot;
@@ -300,10 +256,10 @@ void Buffer::_clear_pending_stage_locked(bool disconnect_staged_ranks) {
 
 void Buffer::_publish_staged_slot_locked() {
     EP_HOST_ASSERT(scale_stage_pending && "no staged slot to publish");
-    // Activation is assumed to happen at a quiescent point.
+    // This is a quiescent commit. The caller must prevent new LL launches
+    // until the staged slot is published and the old views are destroyed.
     CUDA_CHECK(cudaDeviceSynchronize());
     _publish_active_gpu_ctx_slot(staged_new_slot);
-    _wait_for_slot_drain(staged_old_slot);
     _nixl_ep_memory_views_destroy_for_slot(staged_old_slot);
     scale_stage_pending = false;
     staged_old_slot = -1;
@@ -596,15 +552,7 @@ void Buffer::destroy() {
 
 void Buffer::barrier() {
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    const int ctx_slot = _get_active_gpu_ctx_slot();
-    ll_inflight_per_slot[ctx_slot].fetch_add(1, std::memory_order_acq_rel);
-    try {
-        ep_kernels::barrier(gpu_ctx_handle_ptr, mask_buffer_ptr, timeout_cycles, compute_stream);
-        _mark_ll_launch(ctx_slot, compute_stream);
-    } catch (...) {
-        ll_inflight_per_slot[ctx_slot].fetch_sub(1, std::memory_order_acq_rel);
-        throw;
-    }
+    ep_kernels::barrier(gpu_ctx_handle_ptr, mask_buffer_ptr, timeout_cycles, compute_stream);
 }
 
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
@@ -1359,7 +1307,6 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    const int ctx_slot = _get_active_gpu_ctx_slot();
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
@@ -1394,29 +1341,22 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=, this](int phases) {
-        ll_inflight_per_slot[ctx_slot].fetch_add(1, std::memory_order_acq_rel);
-        try {
-            ep_kernels::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-                                   packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
-                                   packed_recv_count.data_ptr<int>(),
-                                   mask_buffer_ptr,
-                                   cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
-                                   dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                                   buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
-                                   buffer.dispatch_rdma_send_buffer,
-                                  x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
-                                   next_clean_meta.first, next_clean_meta.second,
-                                   num_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                                   num_topk, active_rank_bound, num_experts_per_rank, rank,
-                                   use_fp8, round_scale, use_ue8m0,
-                                   timeout_cycles,
-                                   workspace, num_device_sms,
-                                   launch_stream, phases, gpu_ctx_handle_ptr);
-            _mark_ll_launch(ctx_slot, launch_stream);
-        } catch (...) {
-            ll_inflight_per_slot[ctx_slot].fetch_sub(1, std::memory_order_acq_rel);
-            throw;
-        }
+        ep_kernels::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
+                             packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
+                             packed_recv_count.data_ptr<int>(),
+                             mask_buffer_ptr,
+                             cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                             dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                             buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
+                             buffer.dispatch_rdma_send_buffer,
+                             x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
+                             next_clean_meta.first, next_clean_meta.second,
+                             num_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                             num_topk, active_rank_bound, num_experts_per_rank, rank,
+                             use_fp8, round_scale, use_ue8m0,
+                             timeout_cycles,
+                             workspace, num_device_sms,
+                             launch_stream, phases, gpu_ctx_handle_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1488,7 +1428,6 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    const int ctx_slot = _get_active_gpu_ctx_slot();
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
@@ -1507,26 +1446,19 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=, this](int phases) {
-        ll_inflight_per_slot[ctx_slot].fetch_add(1, std::memory_order_acq_rel);
-        try {
-            ep_kernels::combine(combined_x.data_ptr(),
-                                  buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
-                                  buffer.combine_rdma_send_buffer,
-                                  x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
-                                  src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
-                                  mask_buffer_ptr,
-                                  combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                                  next_clean_meta.first, next_clean_meta.second,
-                                  num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                                  num_topk, active_rank_bound, num_experts_per_rank, rank,
-                                 use_logfmt, timeout_cycles,
-                                  workspace, num_device_sms,
-                                  launch_stream, phases, zero_copy, gpu_ctx_handle_ptr);
-            _mark_ll_launch(ctx_slot, launch_stream);
-        } catch (...) {
-            ll_inflight_per_slot[ctx_slot].fetch_sub(1, std::memory_order_acq_rel);
-            throw;
-        }
+        ep_kernels::combine(combined_x.data_ptr(),
+                            buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
+                            buffer.combine_rdma_send_buffer,
+                            x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
+                            src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+                            mask_buffer_ptr,
+                            combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                            next_clean_meta.first, next_clean_meta.second,
+                            num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                            num_topk, active_rank_bound, num_experts_per_rank, rank,
+                            use_logfmt, timeout_cycles,
+                            workspace, num_device_sms,
+                            launch_stream, phases, zero_copy, gpu_ctx_handle_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1700,7 +1632,6 @@ void Buffer::_nixl_ep_init(void) {
 
 void Buffer::_nixl_ep_destroy(void) {
     for (int slot = 0; slot < kNumGpuCtxSlots; ++slot) {
-        _wait_for_slot_drain(slot);
         _nixl_ep_memory_views_destroy_for_slot(slot);
         if (gpu_ctx_ptr_slots[slot] != nullptr) {
             cudaFree(gpu_ctx_ptr_slots[slot]);
