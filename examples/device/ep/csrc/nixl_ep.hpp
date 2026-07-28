@@ -34,6 +34,7 @@
 #include <tuple>
 #include <vector>
 #include <string>
+#include <atomic>
 
 #include <memory>
 #include "config.hpp"
@@ -156,8 +157,15 @@ private:
     std::unique_ptr<NixlAgentInfo> nixl_agent_info;
     std::vector<NixlPeerInfo> nixl_peer_info;
     NixlPeerInfo my_peer_info;
-    nixl_ep::gpu_nixl_ctx gpu_ctx;
-    nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
+    static constexpr int kNumGpuCtxSlots = 2;
+    nixl_ep::gpu_nixl_ctx gpu_ctx_slots[kNumGpuCtxSlots];
+    nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr_slots[kNumGpuCtxSlots] = {nullptr, nullptr};
+    nixl_ep::gpu_nixl_ctx** gpu_ctx_handle_ptr = nullptr;
+    std::atomic<int> active_gpu_ctx_slot{0};
+    bool scale_stage_pending = false;
+    int staged_new_slot = -1;
+    int staged_old_slot = -1;
+    std::vector<int> staged_ranks;
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
 
@@ -169,8 +177,13 @@ private:
     void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
 
     void _nixl_ep_init(void);
-    void _nixl_ep_memory_views_create(void);
-    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_memory_views_create_for_slot(int slot);
+    void _nixl_ep_memory_views_destroy_for_slot(int slot);
+    int _get_active_gpu_ctx_slot() const;
+    void _publish_active_gpu_ctx_slot(int slot);
+    void _stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in);
+    void _clear_pending_stage_locked(bool disconnect_staged_ranks);
+    void _publish_staged_slot_locked();
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
     void set_active_rank_bound(int bound);
