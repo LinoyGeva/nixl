@@ -162,6 +162,7 @@ private:
     nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr_slots[kNumGpuCtxSlots] = {nullptr, nullptr};
     nixl_ep::gpu_nixl_ctx** gpu_ctx_handle_ptr = nullptr;
     std::atomic<int> active_gpu_ctx_slot{0};
+    std::atomic<bool> reconfig_in_progress{false};
     bool scale_stage_pending = false;
     int staged_new_slot = -1;
     int staged_old_slot = -1;
