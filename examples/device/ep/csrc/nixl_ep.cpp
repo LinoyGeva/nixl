@@ -90,6 +90,29 @@ namespace {
     if (PyGILState_Check())                                                    \
         _nixl_ep_gil_release.emplace()
 
+class ReconfigInProgressGuard {
+public:
+    explicit ReconfigInProgressGuard(std::atomic<bool>& in_progress)
+        : in_progress_(in_progress) {
+        bool expected = false;
+        if (!in_progress_.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel)) {
+            throw std::runtime_error(
+                "Scale operation busy: another connect/disconnect is in progress");
+        }
+    }
+
+    ~ReconfigInProgressGuard() {
+        in_progress_.store(false, std::memory_order_release);
+    }
+
+    ReconfigInProgressGuard(const ReconfigInProgressGuard&) = delete;
+    ReconfigInProgressGuard& operator=(const ReconfigInProgressGuard&) = delete;
+
+private:
+    std::atomic<bool>& in_progress_;
+};
+
 void sleep_ms(int milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 }
@@ -652,6 +675,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
+    ReconfigInProgressGuard guard(reconfig_in_progress);
     NIXL_EP_RELEASE_GIL();
 
     const bool use_staged_ll_flow = low_latency_mode;
@@ -762,6 +786,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
+    ReconfigInProgressGuard guard(reconfig_in_progress);
     NIXL_EP_RELEASE_GIL();
     if (scale_stage_pending) {
         throw std::runtime_error("Scale stage already pending; activate previous stage first");
