@@ -93,6 +93,62 @@ Buffer::Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int tim
         explicitly_destroy(explicitly_destroy),
         comm_stream(at::cuda::getStreamFromPool(true)) {}
 
+int Buffer::_get_active_gpu_ctx_slot() const {
+    return active_gpu_ctx_slot.load(std::memory_order_acquire);
+}
+
+void Buffer::_publish_active_gpu_ctx_slot(int slot) {
+    EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
+    auto* slot_ptr = gpu_ctx_ptr_slots[slot];
+    EP_HOST_ASSERT(slot_ptr != nullptr && "publish slot must have allocated device ctx");
+    CUDA_CHECK(cudaMemcpy(gpu_ctx_handle_ptr, &slot_ptr, sizeof(slot_ptr), cudaMemcpyHostToDevice));
+    active_gpu_ctx_slot.store(slot, std::memory_order_release);
+}
+
+void Buffer::_stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in) {
+    EP_HOST_ASSERT(!scale_stage_pending && "staging already pending");
+    const int old_slot = _get_active_gpu_ctx_slot();
+    const int new_slot = 1 - old_slot;
+    _nixl_ep_memory_views_destroy_for_slot(new_slot);
+    _nixl_ep_memory_views_create_for_slot(new_slot);
+    staged_old_slot = old_slot;
+    staged_new_slot = new_slot;
+    staged_ranks = staged_ranks_in;
+    scale_stage_pending = true;
+}
+
+void Buffer::_clear_pending_stage_locked(bool disconnect_staged_ranks) {
+    EP_HOST_ASSERT(scale_stage_pending && "no pending stage to clear");
+    EP_HOST_ASSERT(staged_new_slot >= 0 && staged_new_slot < kNumGpuCtxSlots);
+    if (disconnect_staged_ranks && !staged_ranks.empty()) {
+        _nixl_agents_peer_info_cleanup(staged_ranks);
+        _nixl_agents_disconnect(staged_ranks);
+        for (int staged_rank : staged_ranks) {
+            remote_ranks.erase(
+                std::remove(remote_ranks.begin(), remote_ranks.end(), staged_rank),
+                remote_ranks.end());
+        }
+    }
+    _nixl_ep_memory_views_destroy_for_slot(staged_new_slot);
+    scale_stage_pending = false;
+    staged_old_slot = -1;
+    staged_new_slot = -1;
+    staged_ranks.clear();
+}
+
+void Buffer::_publish_staged_slot_locked() {
+    EP_HOST_ASSERT(scale_stage_pending && "no staged slot to publish");
+    // This is a quiescent commit. The caller must prevent new LL launches
+    // until the staged slot is published and the old views are destroyed.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    _publish_active_gpu_ctx_slot(staged_new_slot);
+    _nixl_ep_memory_views_destroy_for_slot(staged_old_slot);
+    scale_stage_pending = false;
+    staged_old_slot = -1;
+    staged_new_slot = -1;
+    staged_ranks.clear();
+}
+
 bool Buffer::_is_rank_connected(int rank_id) const {
     return rank_id == rank or std::find(remote_ranks.begin(), remote_ranks.end(), rank_id) != remote_ranks.end();
 }
@@ -378,7 +434,7 @@ void Buffer::destroy() {
 
 void Buffer::barrier() {
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    ep_kernels::barrier(gpu_ctx_ptr, mask_buffer_ptr, timeout_cycles, compute_stream);
+    ep_kernels::barrier(gpu_ctx_handle_ptr, mask_buffer_ptr, timeout_cycles, compute_stream);
 }
 
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
@@ -474,12 +530,16 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
+    NIXL_EP_RELEASE_GIL();
 
-    if (!low_latency_mode && num_nvl_bytes > 0) {
+    const bool use_staged_ll_flow = low_latency_mode;
+    if (!use_staged_ll_flow && num_nvl_bytes > 0) {
         EP_HOST_ASSERT(remote_ranks.empty() && "connect_ranks called more than once in high-throughput mode; elasticity is not yet supported");
     }
-    EP_HOST_ASSERT(low_latency_mode || activate);
-    NIXL_EP_RELEASE_GIL();
+    if (use_staged_ll_flow && scale_stage_pending && !activate) {
+        // Override a previously staged-but-not-activated topology with the latest request.
+        _clear_pending_stage_locked(/*disconnect_staged_ranks=*/true);
+    }
 
     std::vector<int> new_ranks;
     std::vector<nixl_blob_t> new_ranks_mds;
@@ -503,22 +563,53 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     }
 
     if (!new_ranks.empty()) {
-        _nixl_agents_connect(new_ranks, new_ranks_mds);
+        bool staged_this_call = false;
+        try {
+            _nixl_agents_connect(new_ranks, new_ranks_mds);
+            _nixl_agents_peer_info_gather(new_ranks);
 
-        _nixl_agents_peer_info_gather(new_ranks);
-
-        _nixl_ep_memory_views_destroy();
-
-        _nixl_ep_memory_views_create();
-
-        CUDA_CHECK(cudaDeviceSynchronize());
+            if (scale_stage_pending) {
+                throw std::runtime_error("Scale stage already pending; activate previous stage first");
+            }
+            if (use_staged_ll_flow) {
+                _stage_inactive_slot_locked(new_ranks);
+                staged_this_call = true;
+            } else {
+                const int active_slot = _get_active_gpu_ctx_slot();
+                _nixl_ep_memory_views_destroy_for_slot(active_slot);
+                _nixl_ep_memory_views_create_for_slot(active_slot);
+                _publish_active_gpu_ctx_slot(active_slot);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        } catch (...) {
+            // Roll back newly connected ranks if staging fails before activation.
+            _nixl_agents_peer_info_cleanup(new_ranks);
+            _nixl_agents_disconnect(new_ranks);
+            for (int new_rank : new_ranks) {
+                remote_ranks.erase(
+                    std::remove(remote_ranks.begin(), remote_ranks.end(), new_rank),
+                    remote_ranks.end());
+            }
+            if (staged_this_call) {
+                _clear_pending_stage_locked(/*disconnect_staged_ranks=*/false);
+            }
+            throw;
+        }
     }
 
     if (activate) {
-        for (int remote_rank : remote_ranks_list) {
+        std::vector<int> ranks_to_activate = remote_ranks_list;
+        if (use_staged_ll_flow && scale_stage_pending) {
+            ranks_to_activate = staged_ranks;
+            _publish_staged_slot_locked();
+        }
+        for (int remote_rank : ranks_to_activate) {
             if (remote_rank != rank)
                 update_mask_buffer(remote_rank, false);
         }
+    } else if (use_staged_ll_flow && !new_ranks.empty()) {
+        // Stage is now pending and must be activated before another topology stage.
+        EP_HOST_ASSERT(scale_stage_pending && "expected pending staged slot after connect");
     }
 
     // Ready to use
@@ -529,6 +620,10 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
     NIXL_EP_RELEASE_GIL();
+    if (scale_stage_pending) {
+        throw std::runtime_error("Scale stage already pending; activate previous stage first");
+    }
+    const bool use_staged_ll_flow = low_latency_mode;
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -538,8 +633,6 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         EP_HOST_ASSERT(_is_rank_connected(removed_rank));
         update_mask_buffer(removed_rank, true);  // mask=true
     }
-
-    _nixl_ep_memory_views_destroy();
 
     _nixl_agents_peer_info_cleanup(remote_ranks_list);
 
@@ -552,8 +645,15 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
             remote_ranks.end()
         );
     }
-
-    _nixl_ep_memory_views_create();
+    if (use_staged_ll_flow) {
+        _stage_inactive_slot_locked({});
+        _publish_staged_slot_locked();
+    } else {
+        const int active_slot = _get_active_gpu_ctx_slot();
+        _nixl_ep_memory_views_destroy_for_slot(active_slot);
+        _nixl_ep_memory_views_create_for_slot(active_slot);
+        _publish_active_gpu_ctx_slot(active_slot);
+    }
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
@@ -759,7 +859,8 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                                  buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                  barrier_signal_ptrs_gpu, rank, comm_stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                 num_nvl_bytes, timeout_cycles, true, low_latency_mode, gpu_ctx);
+                                 num_nvl_bytes, timeout_cycles, true, low_latency_mode,
+                                 gpu_ctx_slots[_get_active_gpu_ctx_slot()]);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -782,7 +883,8 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                                    buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                    barrier_signal_ptrs_gpu, rank, comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                   num_nvl_bytes, timeout_cycles, low_latency_mode, gpu_ctx);
+                                   num_nvl_bytes, timeout_cycles, low_latency_mode,
+                                   gpu_ctx_slots[_get_active_gpu_ctx_slot()]);
 
         // Synchronize total received tokens and tokens per expert
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -866,7 +968,8 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
-                        comm_stream, num_channels, timeout_cycles, low_latency_mode, gpu_ctx);
+                        comm_stream, num_channels, timeout_cycles, low_latency_mode,
+                        gpu_ctx_slots[_get_active_gpu_ctx_slot()]);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -981,7 +1084,8 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                              barrier_signal_ptrs_gpu, rank, comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                             num_nvl_bytes, timeout_cycles, false, low_latency_mode, gpu_ctx);
+                             num_nvl_bytes, timeout_cycles, false, low_latency_mode,
+                             gpu_ctx_slots[_get_active_gpu_ctx_slot()]);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1005,7 +1109,8 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
                        num_tokens, num_combined_tokens, hidden, num_topk,
                        rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                       rank, num_ranks, comm_stream, num_channels, timeout_cycles, low_latency_mode, gpu_ctx);
+                       rank, num_ranks, comm_stream, num_channels, timeout_cycles, low_latency_mode,
+                       gpu_ctx_slots[_get_active_gpu_ctx_slot()]);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1113,21 +1218,21 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=, this](int phases) {
         ep_kernels::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-                               packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
-                               packed_recv_count.data_ptr<int>(),
-                               mask_buffer_ptr,
-                               cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
-                               dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                               buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
-                               buffer.dispatch_rdma_send_buffer,
-                              x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
-                               next_clean_meta.first, next_clean_meta.second,
-                               num_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                               num_topk, active_rank_bound, num_experts_per_rank, rank,
-                               use_fp8, round_scale, use_ue8m0,
-                               timeout_cycles,
-                               workspace, num_device_sms,
-                               launch_stream, phases, gpu_ctx_ptr);
+                             packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
+                             packed_recv_count.data_ptr<int>(),
+                             mask_buffer_ptr,
+                             cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                             dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                             buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
+                             buffer.dispatch_rdma_send_buffer,
+                             x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
+                             next_clean_meta.first, next_clean_meta.second,
+                             num_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                             num_topk, active_rank_bound, num_experts_per_rank, rank,
+                             use_fp8, round_scale, use_ue8m0,
+                             timeout_cycles,
+                             workspace, num_device_sms,
+                             launch_stream, phases, gpu_ctx_handle_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1218,18 +1323,18 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=, this](int phases) {
         ep_kernels::combine(combined_x.data_ptr(),
-                              buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
-                              buffer.combine_rdma_send_buffer,
-                              x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
-                              src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
-                              mask_buffer_ptr,
-                              combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                              next_clean_meta.first, next_clean_meta.second,
-                              num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                              num_topk, active_rank_bound, num_experts_per_rank, rank,
-                             use_logfmt, timeout_cycles,
-                              workspace, num_device_sms,
-                              launch_stream, phases, zero_copy, gpu_ctx_ptr);
+                            buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
+                            buffer.combine_rdma_send_buffer,
+                            x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(), topk_weights.data_ptr<float>(),
+                            src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+                            mask_buffer_ptr,
+                            combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                            next_clean_meta.first, next_clean_meta.second,
+                            num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                            num_topk, active_rank_bound, num_experts_per_rank, rank,
+                            use_logfmt, timeout_cycles,
+                            workspace, num_device_sms,
+                            launch_stream, phases, zero_copy, gpu_ctx_handle_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1281,8 +1386,16 @@ void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < max_num_ranks);
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
-    if (!mask)
+    if (!mask) {
+        if (scale_stage_pending) {
+            EP_HOST_ASSERT(
+                std::find(staged_ranks.begin(), staged_ranks.end(), rank_to_mask)
+                    != staged_ranks.end()
+                && "cannot unmask a rank outside the pending scale stage");
+            _publish_staged_slot_locked();
+        }
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
+    }
     active_ranks[rank_to_mask] = !mask;
     _refresh_active_rank_bound();
     ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
@@ -1321,7 +1434,12 @@ std::string Buffer::get_local_metadata() const {
     return metadata_blob;
 }
 
-void Buffer::_nixl_ep_memory_views_create(void) {
+void Buffer::_nixl_ep_memory_views_create_for_slot(int slot) {
+    EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
+    auto& gpu_ctx = gpu_ctx_slots[slot];
+    auto* gpu_ctx_ptr = gpu_ctx_ptr_slots[slot];
+    EP_HOST_ASSERT(gpu_ctx_ptr != nullptr);
+
     nixl_remote_dlist_t remote_descs(VRAM_SEG);
     nixl_remote_dlist_t barrier_descs(VRAM_SEG);
     nixl_local_dlist_t local_descs(VRAM_SEG);
@@ -1353,7 +1471,9 @@ void Buffer::_nixl_ep_memory_views_create(void) {
     CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
 }
 
-void Buffer::_nixl_ep_memory_views_destroy(void) {
+void Buffer::_nixl_ep_memory_views_destroy_for_slot(int slot) {
+    EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
+    auto& gpu_ctx = gpu_ctx_slots[slot];
     if (gpu_ctx.local_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.local_mvh);
     if (gpu_ctx.remote_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.remote_mvh);
     if (gpu_ctx.barrier_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.barrier_mvh);
@@ -1365,25 +1485,38 @@ void Buffer::_nixl_ep_memory_views_destroy(void) {
 }
 
 void Buffer::_nixl_ep_init(void) {
-    gpu_ctx = {
-        .sync_buffer_ptr = sync_buffer_ptr,
-        .sync_count_ptr = sync_count_ptr,
-        .last_ht_barrier_counter = last_ht_barrier_counter,
-        .local_ht_barrier_counter_ptr = local_ht_barrier_counter,
-        .rdma_buffer_ptr = rdma_buffer_ptr,
-        .max_num_ranks = max_num_ranks,
-        .num_rdma_ranks = num_rdma_ranks,
-        .rank = rank,
-    };
-    CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr, sizeof(gpu_nixl_ctx)));
-    CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
+    for (int slot = 0; slot < kNumGpuCtxSlots; ++slot) {
+        gpu_ctx_slots[slot] = {
+            .sync_buffer_ptr = sync_buffer_ptr,
+            .sync_count_ptr = sync_count_ptr,
+            .last_ht_barrier_counter = last_ht_barrier_counter,
+            .local_ht_barrier_counter_ptr = local_ht_barrier_counter,
+            .rdma_buffer_ptr = rdma_buffer_ptr,
+            .max_num_ranks = max_num_ranks,
+            .num_rdma_ranks = num_rdma_ranks,
+            .rank = rank,
+        };
+        CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr_slots[slot], sizeof(gpu_nixl_ctx)));
+        CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr_slots[slot],
+                              &gpu_ctx_slots[slot],
+                              sizeof(gpu_nixl_ctx),
+                              cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMalloc(&gpu_ctx_handle_ptr, sizeof(gpu_nixl_ctx*)));
+    _publish_active_gpu_ctx_slot(0);
 }
 
 void Buffer::_nixl_ep_destroy(void) {
-    _nixl_ep_memory_views_destroy();
-    if (gpu_ctx_ptr != nullptr) {
-        cudaFree(gpu_ctx_ptr);
-        gpu_ctx_ptr = nullptr;
+    for (int slot = 0; slot < kNumGpuCtxSlots; ++slot) {
+        _nixl_ep_memory_views_destroy_for_slot(slot);
+        if (gpu_ctx_ptr_slots[slot] != nullptr) {
+            cudaFree(gpu_ctx_ptr_slots[slot]);
+            gpu_ctx_ptr_slots[slot] = nullptr;
+        }
+    }
+    if (gpu_ctx_handle_ptr != nullptr) {
+        cudaFree(gpu_ctx_handle_ptr);
+        gpu_ctx_handle_ptr = nullptr;
     }
 }
 
