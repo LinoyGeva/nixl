@@ -38,6 +38,33 @@
 #include "kernels/configs.cuh"
 #include <cstdio>
 #include <fstream>
+
+namespace {
+
+inline double prep_timer_wall() {
+    using clock = std::chrono::system_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+struct PrepTimerScope {
+    const char* stage;
+    double t0;
+    explicit PrepTimerScope(const char* stage_name) : stage(stage_name), t0(prep_timer_wall()) {
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] stage=%s event=start t_wall=%.6f\n",
+                     stage, t0);
+        std::fflush(stderr);
+    }
+    ~PrepTimerScope() {
+        const double t1 = prep_timer_wall();
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] stage=%s event=end t_wall=%.6f dt_ms=%.1f\n",
+                     stage, t1, (t1 - t0) * 1000.0);
+        std::fflush(stderr);
+    }
+};
+
+}  // namespace
 #include <unistd.h>
 #include <stdio.h>
 #include "kernels/exception.cuh"
@@ -477,37 +504,58 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     std::vector<int> new_ranks;
     std::vector<nixl_blob_t> new_ranks_mds;
 
-    if (all_gathered_handles.size() > 0)
+    if (all_gathered_handles.size() > 0) {
+        PrepTimerScope timer("connect_ranks.ipc_handles_sync");
         _ipc_handles_sync(all_gathered_handles);
+    }
 
-    for (size_t i = 0; i < remote_ranks_list.size(); i++) {
-        int remote_rank = remote_ranks_list[i];
-        EP_HOST_ASSERT(remote_rank >= 0 and remote_rank < max_num_ranks);
-        // Skip self and ranks we are already connected to
-        if (remote_rank == rank or _is_rank_connected(remote_rank))
-            continue;
+    {
+        PrepTimerScope timer("connect_ranks.filter_and_memset");
+        for (size_t i = 0; i < remote_ranks_list.size(); i++) {
+            int remote_rank = remote_ranks_list[i];
+            EP_HOST_ASSERT(remote_rank >= 0 and remote_rank < max_num_ranks);
+            // Skip self and ranks we are already connected to
+            if (remote_rank == rank or _is_rank_connected(remote_rank))
+                continue;
 
-        new_ranks.push_back(remote_rank);
-        CUDA_CHECK(cudaMemset(sync_count_ptr + remote_rank, 0, sizeof(int)));
-        CUDA_CHECK(cudaMemset(sync_buffer_ptr + remote_rank, 0, sizeof(int)));
+            new_ranks.push_back(remote_rank);
+            CUDA_CHECK(cudaMemset(sync_count_ptr + remote_rank, 0, sizeof(int)));
+            CUDA_CHECK(cudaMemset(sync_buffer_ptr + remote_rank, 0, sizeof(int)));
 
-        if (remote_mds.has_value())
-            new_ranks_mds.push_back((*remote_mds)[i]);
+            if (remote_mds.has_value())
+                new_ranks_mds.push_back((*remote_mds)[i]);
+        }
     }
 
     if (!new_ranks.empty()) {
-        _nixl_agents_connect(new_ranks, new_ranks_mds);
+        {
+            PrepTimerScope timer("connect_ranks.nixl_agents_connect");
+            _nixl_agents_connect(new_ranks, new_ranks_mds);
+        }
 
-        _nixl_agents_peer_info_gather(new_ranks);
+        {
+            PrepTimerScope timer("connect_ranks.nixl_agents_peer_info_gather");
+            _nixl_agents_peer_info_gather(new_ranks);
+        }
 
-        _nixl_ep_memory_views_destroy();
+        {
+            PrepTimerScope timer("connect_ranks.memory_views_destroy");
+            _nixl_ep_memory_views_destroy();
+        }
 
-        _nixl_ep_memory_views_create();
+        {
+            PrepTimerScope timer("connect_ranks.memory_views_create");
+            _nixl_ep_memory_views_create();
+        }
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+        {
+            PrepTimerScope timer("connect_ranks.cuda_device_synchronize");
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
     }
 
     if (activate) {
+        PrepTimerScope timer("connect_ranks.update_mask");
         for (int remote_rank : remote_ranks_list) {
             if (remote_rank != rank)
                 update_mask_buffer(remote_rank, false);

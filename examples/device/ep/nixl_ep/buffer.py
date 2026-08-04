@@ -18,7 +18,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
+import time
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -38,6 +40,32 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TIMEOUT_MS = 30_000
+_prep_timer_log = logging.getLogger("nixl_ep.prep_timer")
+
+
+@contextmanager
+def _prep_timer(stage: str):
+    """Emit [Elastic EP][prep-timer] lines compatible with investigate_prep_gap.
+
+    Uses stderr print (same stream as C++ prep-timer fprintf) so harness tee
+    captures both Python and native substeps.
+    """
+    t0 = time.time()
+    msg_start = (
+        f"[Elastic EP][prep-timer] stage={stage} event=start t_wall={t0:.6f}"
+    )
+    print(msg_start, flush=True)
+    _prep_timer_log.info(msg_start)
+    try:
+        yield
+    finally:
+        t1 = time.time()
+        msg_end = (
+            f"[Elastic EP][prep-timer] stage={stage} event=end "
+            f"t_wall={t1:.6f} dt_ms={(t1 - t0) * 1000.0:.1f}"
+        )
+        print(msg_end, flush=True)
+        _prep_timer_log.info(msg_end)
 
 
 class Buffer:
@@ -797,20 +825,25 @@ class Buffer:
     def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
         assert self.tcp_store_group is not None, "TCPStore group is not set"
         md_key = f"NIXL_EP/{self.rank}"
-        nixl_metadata_bytes = self.runtime.get_local_metadata()
-        self.tcp_store_group.set(md_key, nixl_metadata_bytes)
+        with _prep_timer("connect_ranks.get_local_metadata"):
+            nixl_metadata_bytes = self.runtime.get_local_metadata()
+        with _prep_timer("connect_ranks.tcp_store_set"):
+            self.tcp_store_group.set(md_key, nixl_metadata_bytes)
 
         remote_md_keys = [f"NIXL_EP/{rank}" for rank in remote_ranks]
         if remote_md_keys:
-            self.tcp_store_group.wait(remote_md_keys, timedelta(seconds=300))
-            remote_mds = self.tcp_store_group.multi_get(remote_md_keys)
+            with _prep_timer("connect_ranks.tcp_store_wait"):
+                self.tcp_store_group.wait(remote_md_keys, timedelta(seconds=300))
+            with _prep_timer("connect_ranks.tcp_store_multi_get"):
+                remote_mds = self.tcp_store_group.multi_get(remote_md_keys)
         else:
             remote_mds = []
 
         try:
             yield remote_mds
         finally:
-            self.tcp_store_group.delete_key(md_key)
+            with _prep_timer("connect_ranks.tcp_store_delete"):
+                self.tcp_store_group.delete_key(md_key)
 
     def _ht_connect_ranks(self, remote_ranks: List[int]) -> None:
         if self.group is not None:
@@ -828,14 +861,18 @@ class Buffer:
         else:
             raise ValueError("Either 'group' or 'comm' must be configured.")
 
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
-        ipc_handles = all_gather_object(local_ipc_handle)
+        with _prep_timer("connect_ranks.get_local_ipc_handle"):
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+        with _prep_timer("connect_ranks.ipc_allgather"):
+            ipc_handles = all_gather_object(local_ipc_handle)
 
         if self.tcp_store_group is not None:
             with self._fetch_remote_metadata_from_tcp_store(remote_ranks) as remote_mds:
-                self.runtime.connect_ranks(remote_ranks, remote_mds, ipc_handles)
+                with _prep_timer("connect_ranks.cpp"):
+                    self.runtime.connect_ranks(remote_ranks, remote_mds, ipc_handles)
         else:
-            self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
+            with _prep_timer("connect_ranks.cpp"):
+                self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
 
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
         """
@@ -851,11 +888,13 @@ class Buffer:
                 with self._fetch_remote_metadata_from_tcp_store(
                     remote_ranks
                 ) as remote_mds:
-                    self.runtime.connect_ranks(
-                        remote_ranks, remote_mds, activate=activate
-                    )
+                    with _prep_timer("connect_ranks.cpp"):
+                        self.runtime.connect_ranks(
+                            remote_ranks, remote_mds, activate=activate
+                        )
             else:
-                self.runtime.connect_ranks(remote_ranks, activate=activate)
+                with _prep_timer("connect_ranks.cpp"):
+                    self.runtime.connect_ranks(remote_ranks, activate=activate)
         else:
             if not activate:
                 raise ValueError(
