@@ -17,6 +17,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <numeric>
 
@@ -37,6 +38,36 @@ namespace {
 
 const std::vector<std::vector<std::string>> illegal_plugin_combinations = {
     {"GDS", "GDS_MT"},
+};
+
+// Prep-timer lines compatible with vllm_on_nixl/investigate_prep_gap.py
+inline double
+prep_timer_wall() {
+    using clock = std::chrono::system_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+struct PrepTimerScope {
+    const char *stage;
+    double t0;
+    explicit PrepTimerScope(const char *stage_name)
+        : stage(stage_name),
+          t0(prep_timer_wall()) {
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] stage=%s event=start t_wall=%.6f\n",
+                     stage,
+                     t0);
+        std::fflush(stderr);
+    }
+    ~PrepTimerScope() {
+        const double t1 = prep_timer_wall();
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] stage=%s event=end t_wall=%.6f dt_ms=%.1f\n",
+                     stage,
+                     t1,
+                     (t1 - t0) * 1000.0);
+        std::fflush(stderr);
+    }
 };
 
 } // namespace
@@ -1470,55 +1501,99 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
     nixl_backend_t nixl_backend;
     nixl_status_t ret;
 
+    const double t_call0 = prep_timer_wall();
+    double dt_import_ms = 0.0;
+    double dt_conn_ms = 0.0;
+    double dt_sections_ms = 0.0;
+    size_t conn_cnt = 0;
+    int backends_ok = 0;
+    std::string remote_agent;
+
     NIXL_LOCK_GUARD(data->lock);
-    ret = sd.importStr(remote_metadata);
-    if (ret != NIXL_SUCCESS) {
-        NIXL_ERROR_FUNC << "failed to deserialize remote metadata";
-        return NIXL_ERR_MISMATCH;
-    }
 
-    std::string remote_agent = sd.getStr("Agent");
-    if (remote_agent.empty()) {
-        NIXL_ERROR_FUNC << "error in deserializing remote agent name";
-        return NIXL_ERR_MISMATCH;
-    }
-
-    if (remote_agent == data->name_) {
-        NIXL_ERROR_FUNC << "remote agent name same as local agent, "
-                           "no need to load metadata";
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
-    NIXL_DEBUG << "Loading remote metadata for agent: " << remote_agent;
-
-    size_t conn_cnt;
-    ret = sd.getBuf("Conns", &conn_cnt, sizeof(conn_cnt));
-    if (ret != NIXL_SUCCESS) {
-        NIXL_ERROR_FUNC << "error getting connection count: " << ret;
-        return NIXL_ERR_MISMATCH;
-    }
-
-    int count = 0;
-    for (size_t i = 0; i < conn_cnt; ++i) {
-        nixl_backend = sd.getStr("t");
-        conn_info = sd.getStr("c");
-
-        if (nixl_backend.empty() || conn_info.empty()) {
+    {
+        PrepTimerScope timer("connect_ranks.loadRemoteMD.import");
+        const double t0 = prep_timer_wall();
+        ret = sd.importStr(remote_metadata);
+        if (ret != NIXL_SUCCESS) {
             NIXL_ERROR_FUNC << "failed to deserialize remote metadata";
             return NIXL_ERR_MISMATCH;
         }
 
-        ret = data->loadConnInfo(remote_agent, nixl_backend, conn_info);
-        if (ret == NIXL_SUCCESS) {
-            count++;
-        } else if (ret != NIXL_ERR_NOT_SUPPORTED) {
-            NIXL_ERROR_FUNC << "error loading connection info for backend '" << nixl_backend
-                            << "' with status " << ret;
-            return ret;
+        remote_agent = sd.getStr("Agent");
+        if (remote_agent.empty()) {
+            NIXL_ERROR_FUNC << "error in deserializing remote agent name";
+            return NIXL_ERR_MISMATCH;
         }
+
+        if (remote_agent == data->name_) {
+            NIXL_ERROR_FUNC << "remote agent name same as local agent, "
+                               "no need to load metadata";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
+        ret = sd.getBuf("Conns", &conn_cnt, sizeof(conn_cnt));
+        if (ret != NIXL_SUCCESS) {
+            NIXL_ERROR_FUNC << "error getting connection count: " << ret;
+            return NIXL_ERR_MISMATCH;
+        }
+        dt_import_ms = (prep_timer_wall() - t0) * 1000.0;
     }
 
-    if ((count == 0) && (conn_cnt > 0)) {
+    NIXL_DEBUG << "Loading remote metadata for agent: " << remote_agent;
+    std::fprintf(stderr,
+                 "[Elastic EP][prep-timer] stage=connect_ranks.loadRemoteMD "
+                 "event=info t_wall=%.6f local_agent=%s remote_agent=%s "
+                 "md_bytes=%zu conn_cnt=%zu\n",
+                 prep_timer_wall(),
+                 data->name_.c_str(),
+                 remote_agent.c_str(),
+                 remote_metadata.size(),
+                 conn_cnt);
+    std::fflush(stderr);
+
+    {
+        PrepTimerScope timer("connect_ranks.loadRemoteMD.load_conn");
+        const double t0 = prep_timer_wall();
+        for (size_t i = 0; i < conn_cnt; ++i) {
+            nixl_backend = sd.getStr("t");
+            conn_info = sd.getStr("c");
+
+            if (nixl_backend.empty() || conn_info.empty()) {
+                NIXL_ERROR_FUNC << "failed to deserialize remote metadata";
+                return NIXL_ERR_MISMATCH;
+            }
+
+            const double t_b0 = prep_timer_wall();
+            ret = data->loadConnInfo(remote_agent, nixl_backend, conn_info);
+            const double t_b1 = prep_timer_wall();
+            std::fprintf(stderr,
+                         "[Elastic EP][prep-timer] "
+                         "stage=connect_ranks.loadRemoteMD.load_conn "
+                         "event=peer_done t_wall=%.6f dt_ms=%.1f "
+                         "local_agent=%s remote_agent=%s backend=%s "
+                         "conn_bytes=%zu status=%d\n",
+                         t_b1,
+                         (t_b1 - t_b0) * 1000.0,
+                         data->name_.c_str(),
+                         remote_agent.c_str(),
+                         nixl_backend.c_str(),
+                         conn_info.size(),
+                         static_cast<int>(ret));
+            std::fflush(stderr);
+
+            if (ret == NIXL_SUCCESS) {
+                backends_ok++;
+            } else if (ret != NIXL_ERR_NOT_SUPPORTED) {
+                NIXL_ERROR_FUNC << "error loading connection info for backend '" << nixl_backend
+                                << "' with status " << ret;
+                return ret;
+            }
+        }
+        dt_conn_ms = (prep_timer_wall() - t0) * 1000.0;
+    }
+
+    if ((backends_ok == 0) && (conn_cnt > 0)) {
         NIXL_ERROR_FUNC << "no common backend found";
         return NIXL_ERR_BACKEND;
     }
@@ -1528,12 +1603,36 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
         return NIXL_ERR_MISMATCH;
     }
 
-    ret = data->loadRemoteSections(remote_agent, sd);
-    if (ret != NIXL_SUCCESS) {
-        NIXL_ERROR_FUNC << "error loading remote metadata for agent '" << remote_agent
-                        << "' with status " << ret;
-        return ret;
+    {
+        PrepTimerScope timer("connect_ranks.loadRemoteMD.load_sections");
+        const double t0 = prep_timer_wall();
+        ret = data->loadRemoteSections(remote_agent, sd);
+        dt_sections_ms = (prep_timer_wall() - t0) * 1000.0;
+        if (ret != NIXL_SUCCESS) {
+            NIXL_ERROR_FUNC << "error loading remote metadata for agent '" << remote_agent
+                            << "' with status " << ret;
+            return ret;
+        }
     }
+
+    const double t_call1 = prep_timer_wall();
+    std::fprintf(stderr,
+                 "[Elastic EP][prep-timer] stage=connect_ranks.loadRemoteMD "
+                 "event=stats t_wall=%.6f local_agent=%s remote_agent=%s "
+                 "md_bytes=%zu conn_cnt=%zu backends_ok=%d "
+                 "dt_import_ms=%.1f dt_conn_ms=%.1f dt_sections_ms=%.1f "
+                 "dt_total_ms=%.1f\n",
+                 t_call1,
+                 data->name_.c_str(),
+                 remote_agent.c_str(),
+                 remote_metadata.size(),
+                 conn_cnt,
+                 backends_ok,
+                 dt_import_ms,
+                 dt_conn_ms,
+                 dt_sections_ms,
+                 (t_call1 - t_call0) * 1000.0);
+    std::fflush(stderr);
 
     agent_name = remote_agent;
     return NIXL_SUCCESS;
