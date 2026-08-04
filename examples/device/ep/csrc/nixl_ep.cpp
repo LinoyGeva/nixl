@@ -406,44 +406,110 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
     EP_HOST_ASSERT(!ranks.empty());
     EP_HOST_ASSERT(remote_mds.empty() || remote_mds.size() == ranks.size());
 
-    // Assuming ranks vector does not include current rank and has only new ranks
-    remote_ranks.insert(remote_ranks.end(), ranks.begin(), ranks.end());
-    for (int remote_rank : ranks) {
-        nixl_agent_info->remote_agent_names[remote_rank] = std::to_string(remote_rank);
+    const char* md_mode = remote_mds.empty() ? "fetchRemoteMD" : "loadRemoteMD";
+    {
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] stage=connect_ranks.nixl_agents_connect "
+                     "event=info t_wall=%.6f rank=%d md_mode=%s n_peers=%zu peers=",
+                     prep_timer_wall(), rank, md_mode, ranks.size());
+        for (size_t i = 0; i < ranks.size(); i++) {
+            std::fprintf(stderr, "%s%d", i ? "," : "", ranks[i]);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+
+    {
+        PrepTimerScope timer("connect_ranks.nixl_agents_connect.setup");
+        // Assuming ranks vector does not include current rank and has only new ranks
+        remote_ranks.insert(remote_ranks.end(), ranks.begin(), ranks.end());
+        for (int remote_rank : ranks) {
+            nixl_agent_info->remote_agent_names[remote_rank] = std::to_string(remote_rank);
+        }
     }
 
     // Fire all get metadata requests in parallel
-    for (size_t i = 0; i < ranks.size(); i++) {
-        int remote_rank = ranks[i];
-        std::string agent_name;
+    {
+        PrepTimerScope timer("connect_ranks.nixl_agents_connect.fire_remote_md");
+        for (size_t i = 0; i < ranks.size(); i++) {
+            int remote_rank = ranks[i];
+            std::string agent_name;
+            const double t_fire0 = prep_timer_wall();
 
-        nixl_status_t status = remote_mds.empty()
-            ? nixl_agent_info->agent->fetchRemoteMD(nixl_agent_info->remote_agent_names[remote_rank])
-            : nixl_agent_info->agent->loadRemoteMD(remote_mds[i], agent_name);
+            nixl_status_t status = remote_mds.empty()
+                ? nixl_agent_info->agent->fetchRemoteMD(nixl_agent_info->remote_agent_names[remote_rank])
+                : nixl_agent_info->agent->loadRemoteMD(remote_mds[i], agent_name);
 
-        if (status != NIXL_SUCCESS) {
-            throw std::runtime_error("Failed to get metadata for remote agent " +
-                                    std::to_string(remote_rank) + ", status: " + std::to_string(status));
+            const double t_fire1 = prep_timer_wall();
+            std::fprintf(stderr,
+                         "[Elastic EP][prep-timer] "
+                         "stage=connect_ranks.nixl_agents_connect.fire_remote_md "
+                         "event=peer_done t_wall=%.6f dt_ms=%.1f local_rank=%d "
+                         "remote_rank=%d md_mode=%s status=%d\n",
+                         t_fire1, (t_fire1 - t_fire0) * 1000.0, rank, remote_rank,
+                         md_mode, static_cast<int>(status));
+            std::fflush(stderr);
+
+            if (status != NIXL_SUCCESS) {
+                throw std::runtime_error("Failed to get metadata for remote agent " +
+                                        std::to_string(remote_rank) + ", status: " + std::to_string(status));
+            }
         }
     }
 
     // Wait for all remote metadata to be available
-    std::vector<bool> peer_ready(max_num_ranks, false);
-    int peers_remaining = static_cast<int>(ranks.size());
+    {
+        PrepTimerScope timer("connect_ranks.nixl_agents_connect.wait_remote_md");
+        std::vector<bool> peer_ready(max_num_ranks, false);
+        int peers_remaining = static_cast<int>(ranks.size());
+        int n_iters = 0;
+        int n_sleeps = 0;
+        int n_checks = 0;
+        double check_ms_total = 0.0;
+        double sleep_ms_total = 0.0;
 
-    while (peers_remaining > 0) {
-        for (int remote_rank : ranks) {
-            if (peer_ready[remote_rank]) continue;
+        while (peers_remaining > 0) {
+            n_iters++;
+            for (int remote_rank : ranks) {
+                if (peer_ready[remote_rank]) continue;
 
-            nixl_xfer_dlist_t empty_descs(VRAM_SEG);
-            if (nixl_agent_info->agent->checkRemoteMD(std::to_string(remote_rank), empty_descs) == NIXL_SUCCESS) {
-                peer_ready[remote_rank] = true;
-                peers_remaining--;
+                nixl_xfer_dlist_t empty_descs(VRAM_SEG);
+                const double t_chk0 = prep_timer_wall();
+                const nixl_status_t st = nixl_agent_info->agent->checkRemoteMD(
+                    std::to_string(remote_rank), empty_descs);
+                const double t_chk1 = prep_timer_wall();
+                check_ms_total += (t_chk1 - t_chk0) * 1000.0;
+                n_checks++;
+
+                if (st == NIXL_SUCCESS) {
+                    peer_ready[remote_rank] = true;
+                    peers_remaining--;
+                    std::fprintf(stderr,
+                                 "[Elastic EP][prep-timer] "
+                                 "stage=connect_ranks.nixl_agents_connect.wait_remote_md "
+                                 "event=peer_ready t_wall=%.6f local_rank=%d "
+                                 "remote_rank=%d peers_remaining=%d n_iters=%d\n",
+                                 t_chk1, rank, remote_rank, peers_remaining, n_iters);
+                    std::fflush(stderr);
+                }
+            }
+            if (peers_remaining > 0) {
+                const double t_slp0 = prep_timer_wall();
+                sleep_ms(10);
+                const double t_slp1 = prep_timer_wall();
+                sleep_ms_total += (t_slp1 - t_slp0) * 1000.0;
+                n_sleeps++;
             }
         }
-        if (peers_remaining > 0) {
-            sleep_ms(10);
-        }
+
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] "
+                     "stage=connect_ranks.nixl_agents_connect.wait_remote_md "
+                     "event=stats t_wall=%.6f local_rank=%d n_peers=%zu n_iters=%d "
+                     "n_sleeps=%d n_checks=%d check_ms=%.1f sleep_ms=%.1f\n",
+                     prep_timer_wall(), rank, ranks.size(), n_iters, n_sleeps, n_checks,
+                     check_ms_total, sleep_ms_total);
+        std::fflush(stderr);
     }
 }
 
