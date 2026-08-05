@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -434,9 +435,23 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
         }
     }
 
-    // Fire all get metadata requests in parallel
+    // Fire remote MD installs sequentially. Each load_sections / rkey unpack can
+    // stall the serving GPU (~hundreds of ms). A short sleep_ms(5) did not help:
+    // baseline requests are ~200ms, so punches fused into one multi-second hole.
+    // Pace between peers (default 200ms, override NIXL_EP_MD_UNPACK_PACE_MS) so
+    // in-flight serve work can finish between unpacks. Lengthens fire wall time.
     {
         PrepTimerScope timer("connect_ranks.nixl_agents_connect.fire_remote_md");
+        const char *pace_env = std::getenv("NIXL_EP_MD_UNPACK_PACE_MS");
+        const int pace_ms = pace_env ? std::atoi(pace_env) : 200;
+        std::fprintf(stderr,
+                     "[Elastic EP][prep-timer] "
+                     "stage=connect_ranks.nixl_agents_connect.fire_remote_md "
+                     "event=pace_config t_wall=%.6f local_rank=%d pace_ms=%d "
+                     "n_peers=%zu\n",
+                     prep_timer_wall(), rank, pace_ms, ranks.size());
+        std::fflush(stderr);
+
         for (size_t i = 0; i < ranks.size(); i++) {
             int remote_rank = ranks[i];
             std::string agent_name;
@@ -459,6 +474,20 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
             if (status != NIXL_SUCCESS) {
                 throw std::runtime_error("Failed to get metadata for remote agent " +
                                         std::to_string(remote_rank) + ", status: " + std::to_string(status));
+            }
+
+            if (pace_ms > 0 && i + 1 < ranks.size()) {
+                const double t_pace0 = prep_timer_wall();
+                sleep_ms(pace_ms);
+                const double t_pace1 = prep_timer_wall();
+                std::fprintf(stderr,
+                             "[Elastic EP][prep-timer] "
+                             "stage=connect_ranks.nixl_agents_connect.fire_remote_md "
+                             "event=pace t_wall=%.6f dt_ms=%.1f local_rank=%d "
+                             "after_remote_rank=%d pace_ms=%d\n",
+                             t_pace1, (t_pace1 - t_pace0) * 1000.0, rank,
+                             remote_rank, pace_ms);
+                std::fflush(stderr);
             }
         }
     }
