@@ -124,8 +124,12 @@ private:
     int num_experts_per_rank = 0;
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
 
-    // Stream for communication
+    // Stream for communication (serving datapath: dispatch/combine/barrier)
     at::cuda::CUDAStream comm_stream;
+    // Dedicated stream for connect/disconnect control-path CUDA work so prep
+    // does not share the datapath stream or fall back to the default stream /
+    // device-wide synchronize.
+    at::cuda::CUDAStream connect_stream;
 
     // After synchronization, this flag will be true
     bool available = false;

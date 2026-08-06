@@ -119,7 +119,8 @@ Buffer::Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int tim
         }()),
         rank(rank),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(at::cuda::getStreamFromPool(true)) {}
+        comm_stream(at::cuda::getStreamFromPool(true)),
+        connect_stream(at::cuda::getStreamFromPool(true)) {}
 
 int Buffer::_get_active_gpu_ctx_slot() const {
     return active_gpu_ctx_slot.load(std::memory_order_acquire);
@@ -129,6 +130,7 @@ void Buffer::_publish_active_gpu_ctx_slot(int slot) {
     EP_HOST_ASSERT(slot >= 0 && slot < kNumGpuCtxSlots);
     auto* slot_ptr = gpu_ctx_ptr_slots[slot];
     EP_HOST_ASSERT(slot_ptr != nullptr && "publish slot must have allocated device ctx");
+    // Keep this tiny pointer publish synchronous: source is a stack local.
     CUDA_CHECK(cudaMemcpy(gpu_ctx_handle_ptr, &slot_ptr, sizeof(slot_ptr), cudaMemcpyHostToDevice));
     active_gpu_ctx_slot.store(slot, std::memory_order_release);
 }
@@ -166,9 +168,10 @@ void Buffer::_clear_pending_stage_locked(bool disconnect_staged_ranks) {
 
 void Buffer::_publish_staged_slot_locked() {
     EP_HOST_ASSERT(scale_stage_pending && "no staged slot to publish");
-    // This is a quiescent commit. The caller must prevent new LL launches
-    // until the staged slot is published and the old views are destroyed.
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Quiescent commit: wait only on EP streams (datapath + connect), not the
+    // whole device. Caller must already prevent new LL launches.
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+    CUDA_CHECK(cudaStreamSynchronize(connect_stream));
     _publish_active_gpu_ctx_slot(staged_new_slot);
     _nixl_ep_memory_views_destroy_for_slot(staged_old_slot);
     scale_stage_pending = false;
@@ -681,8 +684,10 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
                 continue;
 
             new_ranks.push_back(remote_rank);
-            CUDA_CHECK(cudaMemset(sync_count_ptr + remote_rank, 0, sizeof(int)));
-            CUDA_CHECK(cudaMemset(sync_buffer_ptr + remote_rank, 0, sizeof(int)));
+            CUDA_CHECK(cudaMemsetAsync(sync_count_ptr + remote_rank, 0, sizeof(int),
+                                       connect_stream));
+            CUDA_CHECK(cudaMemsetAsync(sync_buffer_ptr + remote_rank, 0, sizeof(int),
+                                       connect_stream));
 
             if (remote_mds.has_value())
                 new_ranks_mds.push_back((*remote_mds)[i]);
@@ -719,8 +724,8 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
                 }
                 _publish_active_gpu_ctx_slot(active_slot);
                 {
-                    PrepTimerScope timer("connect_ranks.cuda_device_synchronize");
-                    CUDA_CHECK(cudaDeviceSynchronize());
+                    PrepTimerScope timer("connect_ranks.cuda_stream_synchronize");
+                    CUDA_CHECK(cudaStreamSynchronize(connect_stream));
                 }
             }
         } catch (...) {
@@ -746,13 +751,21 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
             ranks_to_activate = staged_ranks;
             _publish_staged_slot_locked();
         }
+        // Mask updates belong on the connect control stream, not the
+        // prep-thread current/default stream.
+        const auto prev_stream = at::cuda::getCurrentCUDAStream();
+        at::cuda::setCurrentCUDAStream(connect_stream);
         for (int remote_rank : ranks_to_activate) {
             if (remote_rank != rank)
                 update_mask_buffer(remote_rank, false);
         }
+        CUDA_CHECK(cudaStreamSynchronize(connect_stream));
+        at::cuda::setCurrentCUDAStream(prev_stream);
     } else if (use_staged_ll_flow && !new_ranks.empty()) {
         // Stage is now pending and must be activated before another topology stage.
         EP_HOST_ASSERT(scale_stage_pending && "expected pending staged slot after connect");
+        // Ensure memset/memcpy queued on connect_stream are complete before return.
+        CUDA_CHECK(cudaStreamSynchronize(connect_stream));
     }
 
     // Ready to use
@@ -768,14 +781,19 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     }
     const bool use_staged_ll_flow = low_latency_mode;
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Quiesce EP streams before tearing down connectivity (not whole device).
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+    CUDA_CHECK(cudaStreamSynchronize(connect_stream));
 
     // Update mask buffer to mark ranks as inactive
+    const auto prev_stream = at::cuda::getCurrentCUDAStream();
+    at::cuda::setCurrentCUDAStream(connect_stream);
     for (int removed_rank : remote_ranks_list) {
         EP_HOST_ASSERT(removed_rank != rank);
         EP_HOST_ASSERT(_is_rank_connected(removed_rank));
         update_mask_buffer(removed_rank, true);  // mask=true
     }
+    at::cuda::setCurrentCUDAStream(prev_stream);
 
     _nixl_agents_peer_info_cleanup(remote_ranks_list);
 
@@ -796,6 +814,7 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         _nixl_ep_memory_views_destroy_for_slot(active_slot);
         _nixl_ep_memory_views_create_for_slot(active_slot);
         _publish_active_gpu_ctx_slot(active_slot);
+        CUDA_CHECK(cudaStreamSynchronize(connect_stream));
     }
 }
 
@@ -1611,7 +1630,8 @@ void Buffer::_nixl_ep_memory_views_create_for_slot(int slot) {
             EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(ht_barrier_descs, gpu_ctx.ht_barrier_mvh, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
         }
     }
-    CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx),
+                               cudaMemcpyHostToDevice, connect_stream));
 }
 
 void Buffer::_nixl_ep_memory_views_destroy_for_slot(int slot) {
@@ -1640,13 +1660,15 @@ void Buffer::_nixl_ep_init(void) {
             .rank = rank,
         };
         CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr_slots[slot], sizeof(gpu_nixl_ctx)));
-        CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr_slots[slot],
-                              &gpu_ctx_slots[slot],
-                              sizeof(gpu_nixl_ctx),
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(gpu_ctx_ptr_slots[slot],
+                                   &gpu_ctx_slots[slot],
+                                   sizeof(gpu_nixl_ctx),
+                                   cudaMemcpyHostToDevice,
+                                   connect_stream));
     }
     CUDA_CHECK(cudaMalloc(&gpu_ctx_handle_ptr, sizeof(gpu_nixl_ctx*)));
     _publish_active_gpu_ctx_slot(0);
+    CUDA_CHECK(cudaStreamSynchronize(connect_stream));
 }
 
 void Buffer::_nixl_ep_destroy(void) {
