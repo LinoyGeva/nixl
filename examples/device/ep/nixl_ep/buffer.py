@@ -902,6 +902,31 @@ class Buffer:
                 )
             self._ht_connect_ranks(remote_ranks)
 
+    def publish_staged_ranks(self, remote_ranks: List[int]) -> None:
+        """Activate a pre-staged inactive slot with no metadata fetch/import.
+
+        ``connect_ranks(activate=False)`` already imported ``remote_ranks`` and
+        built their inactive memory views. This publishes that slot (C++
+        ``_publish_staged_slot_locked``) and unmasks the ranks. It performs no
+        ``loadRemoteMD`` / OpenMemHandle work, so it is safe on the commit
+        critical path while old ranks keep serving.
+        """
+        if not self.low_latency_mode:
+            raise ValueError("publish_staged_ranks requires low-latency mode")
+        with _prep_timer("connect_ranks.publish_staged"):
+            self.runtime.connect_ranks(remote_ranks, activate=True)
+
+    def is_scale_stage_pending(self) -> bool:
+        """Whether an inactive staged slot is built and awaiting activation.
+
+        After ``connect_ranks(activate=False)`` the new peers are imported and
+        their memory views are built in an inactive slot; this returns True
+        until a publication-only ``connect_ranks(activate=True)`` swaps it in.
+        The control plane can poll this to confirm staged readiness before
+        committing, without triggering any device work.
+        """
+        return self.runtime.is_scale_stage_pending()
+
     def disconnect_ranks(self, remote_ranks: List[int]) -> None:
         """
         Remove connections to remote ranks.
