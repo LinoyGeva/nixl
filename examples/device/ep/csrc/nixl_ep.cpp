@@ -136,7 +136,6 @@ void Buffer::_publish_active_gpu_ctx_slot(int slot) {
 }
 
 void Buffer::_stage_inactive_slot_locked(const std::vector<int>& staged_ranks_in) {
-    PrepTimerScope timer("connect_ranks.stage_inactive_slot");
     EP_HOST_ASSERT(!scale_stage_pending && "staging already pending");
     const int old_slot = _get_active_gpu_ctx_slot();
     const int new_slot = 1 - old_slot;
@@ -168,7 +167,6 @@ void Buffer::_clear_pending_stage_locked(bool disconnect_staged_ranks) {
 }
 
 void Buffer::_publish_staged_slot_locked() {
-    PrepTimerScope timer("connect_ranks.publish_staged_slot");
     EP_HOST_ASSERT(scale_stage_pending && "no staged slot to publish");
     // Quiescent commit: wait only on EP streams (datapath + connect), not the
     // whole device. Caller must already prevent new LL launches.
@@ -334,10 +332,6 @@ Buffer::~Buffer() noexcept {
 
 bool Buffer::is_available() const {
     return available;
-}
-
-bool Buffer::is_scale_stage_pending() const {
-    return scale_stage_pending;
 }
 
 bool Buffer::is_ht_available() const {
@@ -1821,7 +1815,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         }, py::arg("remote_ranks"), py::arg("remote_mds") = std::nullopt, py::arg("ipc_handles") = std::vector<std::optional<pybind11::bytearray>>{}, py::arg("activate") = true)
         .def("disconnect_ranks", &nixl_ep::Buffer::disconnect_ranks)
         .def("is_available", &nixl_ep::Buffer::is_available)
-        .def("is_scale_stage_pending", &nixl_ep::Buffer::is_scale_stage_pending)
         .def("get_num_rdma_ranks", &nixl_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &nixl_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &nixl_ep::Buffer::get_root_rdma_rank)

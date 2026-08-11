@@ -211,12 +211,6 @@ public:
 
     bool is_available() const;
 
-    // True while an inactive (staged) slot has been built by
-    // connect_ranks(activate=false) and is awaiting a publication-only
-    // connect_ranks(activate=true). Lets the control plane poll staged
-    // readiness without forcing device work.
-    bool is_scale_stage_pending() const;
-
     bool is_ht_available() const;
 
     int get_num_rdma_ranks() const;
