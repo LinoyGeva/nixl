@@ -25,6 +25,16 @@ namespace {
 
 constexpr const char *k_vmm_ctx = "vmm_region";
 
+/** Peers import non-fabric memory through legacy CUDA IPC, which costs ~100s of
+ *  ms per peer inside connect_ranks and stalls the local context meanwhile. The
+ *  fallback used to be silent, so report the reason once. */
+void
+warn_no_fabric(const char *reason) noexcept {
+    std::cerr << "DIAG: " << k_vmm_ctx << " - " << reason
+              << "; falling back to cuMemAlloc (peers will import via legacy CUDA IPC, "
+                 "expect slower connect_ranks)\n";
+}
+
 /** Log a non-fatal warning if a CUDA driver API call failed (e.g. during teardown). */
 void
 warn_cu_api(CUresult status, const char *context, const char *operation) noexcept {
@@ -93,6 +103,7 @@ vmm_region::vmm_region(size_t size) {
             }
 
             if (version < 11000) {
+                warn_no_fabric("CUDA driver older than 11.0");
                 return; /* too old — fall back to cudaMalloc */
             }
 
@@ -101,6 +112,8 @@ vmm_region::vmm_region(size_t size) {
                                       CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                                       device) != CUDA_SUCCESS) ||
                 (!fab)) {
+                warn_no_fabric("fabric handles unsupported (check nvidia-caps-imex-channels "
+                               "and the IMEX daemon)");
                 return; /* no fabric — fall back to cudaMalloc */
             }
 
@@ -113,9 +126,7 @@ vmm_region::vmm_region(size_t size) {
             }
 
             if (!rdma_vmm_supported) {
-                std::cerr << "DIAG: " << k_vmm_ctx
-                          << " - GPUDirect RDMA with CUDA VMM not supported; falling back to "
-                             "cuMemAlloc\n";
+                warn_no_fabric("GPUDirect RDMA with CUDA VMM not supported");
                 return;
             }
 
@@ -146,6 +157,8 @@ vmm_region::vmm_region(size_t size) {
         if (mem_create_status != CUDA_SUCCESS) {
             handle_ = 0;
             ctx.fabric_supported = false;
+            warn_cu_api(mem_create_status, k_vmm_ctx, "cuMemCreate with fabric handle");
+            warn_no_fabric("fabric allocation failed");
         } else {
             if (cuMemAddressReserve(&ptr_, size_, 0, 0, 0) != CUDA_SUCCESS) {
                 release();
