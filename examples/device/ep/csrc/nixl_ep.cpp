@@ -494,23 +494,12 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
         }
     }
 
-    // Fire remote MD installs sequentially. Each load_sections / rkey unpack can
-    // stall the serving GPU (~hundreds of ms). A short sleep_ms(5) did not help:
-    // baseline requests are ~200ms, so punches fused into one multi-second hole.
-    // Pace between peers (default 200ms, override NIXL_EP_MD_UNPACK_PACE_MS) so
-    // in-flight serve work can finish between unpacks. Lengthens fire wall time.
+    // Fire remote MD installs sequentially. Each load_sections / rkey unpack imports
+    // the peer's device memory and stalls the local context for its whole duration
+    // (~hundreds of ms), so the per-peer timings below bound how long the local
+    // datapath can be starved during a scale-up.
     {
         PrepTimerScope timer("connect_ranks.nixl_agents_connect.fire_remote_md");
-        const char *pace_env = std::getenv("NIXL_EP_MD_UNPACK_PACE_MS");
-        const int pace_ms = pace_env ? std::atoi(pace_env) : 200;
-        std::fprintf(stderr,
-                     "[Elastic EP][prep-timer] "
-                     "stage=connect_ranks.nixl_agents_connect.fire_remote_md "
-                     "event=pace_config t_wall=%.6f local_rank=%d pace_ms=%d "
-                     "n_peers=%zu\n",
-                     prep_timer_wall(), rank, pace_ms, ranks.size());
-        std::fflush(stderr);
-
         for (size_t i = 0; i < ranks.size(); i++) {
             int remote_rank = ranks[i];
             std::string agent_name;
@@ -533,20 +522,6 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
             if (status != NIXL_SUCCESS) {
                 throw std::runtime_error("Failed to get metadata for remote agent " +
                                         std::to_string(remote_rank) + ", status: " + std::to_string(status));
-            }
-
-            if (pace_ms > 0 && i + 1 < ranks.size()) {
-                const double t_pace0 = prep_timer_wall();
-                sleep_ms(pace_ms);
-                const double t_pace1 = prep_timer_wall();
-                std::fprintf(stderr,
-                             "[Elastic EP][prep-timer] "
-                             "stage=connect_ranks.nixl_agents_connect.fire_remote_md "
-                             "event=pace t_wall=%.6f dt_ms=%.1f local_rank=%d "
-                             "after_remote_rank=%d pace_ms=%d\n",
-                             t_pace1, (t_pace1 - t_pace0) * 1000.0, rank,
-                             remote_rank, pace_ms);
-                std::fflush(stderr);
             }
         }
     }
@@ -613,18 +588,23 @@ void Buffer::_nixl_agents_peer_info_gather(std::vector<int>& ranks) {
         nixl_agent_info->agent->genNotif(std::to_string(remote_rank), my_peer_info_str);
     }
 
+    // getNotifs takes the exclusive agent lock, so polling it without backoff both
+    // burns a core and convoys the lock while the local rank keeps serving.
     for (int remote_rank : ranks) {
-        do {
+        while (!nixl_agent_info->wire_up_done[remote_rank]) {
             nixl_notifs_t notif_map;
             nixl_agent_info->agent->getNotifs(notif_map);
             for (auto &notif : notif_map) {
-                std::string my_peer_info_str = notif.second[0];
-                NixlPeerInfo remote_peer_info;
-                memcpy(&remote_peer_info, my_peer_info_str.c_str(), sizeof(NixlPeerInfo));
-                nixl_peer_info[remote_peer_info.rank] = remote_peer_info;
-                nixl_agent_info->wire_up_done[remote_peer_info.rank] = true;
+                for (const std::string &my_peer_info_str : notif.second) {
+                    NixlPeerInfo remote_peer_info;
+                    memcpy(&remote_peer_info, my_peer_info_str.c_str(), sizeof(NixlPeerInfo));
+                    nixl_peer_info[remote_peer_info.rank] = remote_peer_info;
+                    nixl_agent_info->wire_up_done[remote_peer_info.rank] = true;
+                }
             }
-        } while (!nixl_agent_info->wire_up_done[remote_rank]);
+            if (notif_map.empty())
+                sleep_ms(1);
+        }
     }
 }
 
