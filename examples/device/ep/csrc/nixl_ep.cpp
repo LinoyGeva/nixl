@@ -480,6 +480,8 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     if (all_gathered_handles.size() > 0)
         _ipc_handles_sync(all_gathered_handles);
 
+    pybind11::gil_scoped_release release;
+
     for (size_t i = 0; i < remote_ranks_list.size(); i++) {
         int remote_rank = remote_ranks_list[i];
         EP_HOST_ASSERT(remote_rank >= 0 and remote_rank < max_num_ranks);
@@ -1503,7 +1505,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("connect_ranks", [](nixl_ep::Buffer &buffer, const std::vector<int>& remote_ranks, const std::optional<std::vector<pybind11::bytes>>& remote_mds, const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
             buffer.connect_ranks(remote_ranks, nixl_ep::convert_mds(remote_mds), all_gathered_handles, activate);
         }, py::arg("remote_ranks"), py::arg("remote_mds") = std::nullopt, py::arg("ipc_handles") = std::vector<std::optional<pybind11::bytearray>>{}, py::arg("activate") = true)
-        .def("disconnect_ranks", &nixl_ep::Buffer::disconnect_ranks)
+        .def("disconnect_ranks", &nixl_ep::Buffer::disconnect_ranks,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("is_available", &nixl_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &nixl_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &nixl_ep::Buffer::get_rdma_rank)
@@ -1514,11 +1517,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream", &nixl_ep::Buffer::get_comm_stream)
         .def("destroy", &nixl_ep::Buffer::destroy)
         .def("get_dispatch_layout", &nixl_ep::Buffer::get_dispatch_layout)
-        .def("dispatch", &nixl_ep::Buffer::dispatch)
-        .def("combine", &nixl_ep::Buffer::combine)
+        .def("dispatch", &nixl_ep::Buffer::dispatch,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("combine", &nixl_ep::Buffer::combine,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("ht_dispatch", &nixl_ep::Buffer::ht_dispatch)
         .def("ht_combine", &nixl_ep::Buffer::ht_combine)
-        .def("update_mask_buffer", &nixl_ep::Buffer::update_mask_buffer)
+        .def("update_mask_buffer", &nixl_ep::Buffer::update_mask_buffer,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("query_mask_buffer", &nixl_ep::Buffer::query_mask_buffer)
         .def("clean_mask_buffer", &nixl_ep::Buffer::clean_mask_buffer)
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
